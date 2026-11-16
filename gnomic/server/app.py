@@ -146,16 +146,22 @@ class GameServer:
         if self.owner_deadline is None:
             self.owner_deadline = asyncio.get_running_loop().time() + CLEANUP_SECONDS
         deadline = self.owner_deadline
-        capture_active = "COGAME_SAVE_TRAJECTORY_URI" in os.environ
-        stop_deadline = (
-            deadline
-            if capture_active
-            else min(deadline, asyncio.get_running_loop().time() + 1.0)
-        )
         registered = list(self.registered_channels)
         # In-process fixtures and collectors register channels without a WS route.
         registered.extend(c for c in self.channels.values() if c not in registered)
-        channel_owner = asyncio.create_task(settle_channels(registered, stop_deadline))
+        strict_channels = [
+            c
+            for c in registered
+            if getattr(c, "progress", None)
+            or not isinstance(c, WebSocketSeatChannel)
+            or self.results is None
+        ]
+        legacy_ok_channels = [c for c in registered if c not in strict_channels]
+        strict_owner = asyncio.create_task(settle_channels(strict_channels, deadline))
+        legacy_deadline = min(deadline, asyncio.get_running_loop().time() + 1.0)
+        legacy_owner = asyncio.create_task(
+            settle_channels(legacy_ok_channels, legacy_deadline)
+        )
         engine_tasks = set(self.native_owned_tasks)
         if self.episode_task is not None:
             engine_tasks.add(self.episode_task)
@@ -164,18 +170,35 @@ class GameServer:
             await settle(set(self.native_owned_tasks), deadline, cancel=True)
             and engine_joined
         )
-        channel_joined = await settle({channel_owner}, stop_deadline, cancel=False)
-        if not channel_joined:
-            for channel in registered:
+        strict_joined = await settle({strict_owner}, deadline, cancel=False)
+        if not strict_joined:
+            for channel in strict_channels:
                 channel.seal()
-            await settle({channel_owner}, deadline, cancel=True)
-        channel_settled = (
-            channel_joined
-            and not channel_owner.cancelled()
-            and channel_owner.exception() is None
-            and channel_owner.result()
+            await settle({strict_owner}, deadline, cancel=True)
+        legacy_joined = await settle({legacy_owner}, legacy_deadline, cancel=False)
+        if not legacy_joined:
+            for channel in legacy_ok_channels:
+                channel.seal()
+            await settle({legacy_owner}, deadline, cancel=True)
+        if legacy_ok_channels:
+            for channel in legacy_ok_channels:
+                channel.seal()
+            reader_closures = {
+                asyncio.create_task(c.close_reader()) for c in legacy_ok_channels
+            }
+            await settle(reader_closures, deadline, cancel=True)
+        strict_settled = (
+            strict_joined
+            and not strict_owner.cancelled()
+            and strict_owner.exception() is None
+            and strict_owner.result()
         )
-        self.ownership_joined = engine_joined and (channel_settled or not capture_active)
+        legacy_readers_settled = all(
+            c.sealed and c._reader.done() for c in legacy_ok_channels
+        )
+        self.ownership_joined = (
+            engine_joined and strict_settled and legacy_readers_settled
+        )
         return self.ownership_joined
 
     async def _join_ownership(self) -> bool:

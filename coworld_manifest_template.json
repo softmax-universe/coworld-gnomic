@@ -18,6 +18,7 @@
     "runnable": {
       "type": "game",
       "image": "{{GNOMIC_IMAGE}}",
+      "source_url": "https://github.com/softmax-universe/coworld-gnomic/tree/main",
       "run": [
         "python",
         "-m",
@@ -273,6 +274,7 @@
       "type": "player",
       "description": "Deterministic no-network gnome for certification; passes actions, proposes harmless enactments, and votes AYE.",
       "image": "{{GNOMIC_IMAGE}}",
+      "source_url": "https://github.com/softmax-universe/coworld-gnomic/tree/main",
       "run": [
         "python",
         "-m",
@@ -286,7 +288,8 @@
       "name": "Gnomic Ruleset Strategy Commissioner",
       "type": "commissioner",
       "description": "Ruleset-strategy commissioner plus Gnomic's adapter: candidate gnomes self-play the explicit one-turn deterministic qualifier; Competition runs one three-seat, 45-turn-cap Moot per entrant daily with win scoring and seven-day EWMA standings.",
-      "image": "{{COMMISSIONER_IMAGE}}"
+      "image": "{{COMMISSIONER_IMAGE}}",
+      "source_url": "https://github.com/softmax-universe/coworld-gnomic/tree/main"
     }
   ],
   "reporter": [],
