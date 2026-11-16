@@ -146,10 +146,16 @@ class GameServer:
         if self.owner_deadline is None:
             self.owner_deadline = asyncio.get_running_loop().time() + CLEANUP_SECONDS
         deadline = self.owner_deadline
+        capture_active = "COGAME_SAVE_TRAJECTORY_URI" in os.environ
+        stop_deadline = (
+            deadline
+            if capture_active
+            else min(deadline, asyncio.get_running_loop().time() + 1.0)
+        )
         registered = list(self.registered_channels)
         # In-process fixtures and collectors register channels without a WS route.
         registered.extend(c for c in self.channels.values() if c not in registered)
-        channel_owner = asyncio.create_task(settle_channels(registered, deadline))
+        channel_owner = asyncio.create_task(settle_channels(registered, stop_deadline))
         engine_tasks = set(self.native_owned_tasks)
         if self.episode_task is not None:
             engine_tasks.add(self.episode_task)
@@ -158,20 +164,18 @@ class GameServer:
             await settle(set(self.native_owned_tasks), deadline, cancel=True)
             and engine_joined
         )
-        channel_joined = await settle({channel_owner}, deadline, cancel=False)
+        channel_joined = await settle({channel_owner}, stop_deadline, cancel=False)
         if not channel_joined:
             for channel in registered:
                 channel.seal()
             await settle({channel_owner}, deadline, cancel=True)
-        self.ownership_joined = (
-            engine_joined
-            and channel_joined
-            and (
-                not channel_owner.cancelled()
-                and channel_owner.exception() is None
-                and channel_owner.result()
-            )
+        channel_settled = (
+            channel_joined
+            and not channel_owner.cancelled()
+            and channel_owner.exception() is None
+            and channel_owner.result()
         )
+        self.ownership_joined = engine_joined and (channel_settled or not capture_active)
         return self.ownership_joined
 
     async def _join_ownership(self) -> bool:
@@ -240,12 +244,13 @@ class GameServer:
                 self.results = self.replay = None
                 self._write_interrupted()
                 raise RuntimeError("episode ownership remains unresolved")
-            private = self.episode.capture.finish()
-            if private.episode.status != "completed":
-                self.results = self.replay = None
-                self._write_interrupted()
-                raise RuntimeError("private episode has unresolved native ownership")
-            self._write_private("completed")
+            if "COGAME_SAVE_TRAJECTORY_URI" in os.environ:
+                private = self.episode.capture.finish()
+                if private.episode.status != "completed":
+                    self.results = self.replay = None
+                    self._write_interrupted()
+                    raise RuntimeError("private episode has unresolved native ownership")
+                self._write_private("completed")
             self._write_artifacts()
             await asyncio.gather(
                 *(
