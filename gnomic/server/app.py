@@ -35,7 +35,7 @@ VIEWER_PATH = Path(__file__).parent / "viewer" / "index.html"
 # before the server exits. The certification probe disconnects as soon as it
 # has its ping-pong and first message, so certification pays seconds, not the
 # cap; the cap only bounds a live human viewer holding a finished game open.
-SPECTATOR_DRAIN_SECONDS = 120.0
+SPECTATOR_DRAIN_SECONDS = float(os.environ.get("GNOMIC_SPECTATOR_DRAIN_SECONDS", "5.0"))
 
 
 class GameServer:
@@ -121,6 +121,12 @@ class GameServer:
     def _start_episode(self) -> None:
         assert self.config is not None
         self.started = True
+        if (
+            self.start_task is not None
+            and not self.start_task.done()
+            and self.start_task is not asyncio.current_task()
+        ):
+            self.start_task.cancel()
         self.episode = Episode(
             self.config,
             self._episode_channels(),
@@ -183,10 +189,7 @@ class GameServer:
         if legacy_ok_channels:
             for channel in legacy_ok_channels:
                 channel.seal()
-            reader_closures = {
-                asyncio.create_task(c.close_reader()) for c in legacy_ok_channels
-            }
-            await settle(reader_closures, deadline, cancel=True)
+            await settle({c._reader for c in legacy_ok_channels}, deadline, cancel=True)
         strict_settled = (
             strict_joined
             and not strict_owner.cancelled()
@@ -223,8 +226,11 @@ class GameServer:
         self.request_stop()
         assert self.owner_deadline is not None
         await self._join_ownership()
+        stop_deadline = max(
+            self.owner_deadline, asyncio.get_running_loop().time() + CLEANUP_SECONDS
+        )
         tasks = {t for t in (self.start_task, self.run_task) if t is not None}
-        joined = await settle(tasks, self.owner_deadline, cancel=True)
+        joined = await settle(tasks, stop_deadline, cancel=True)
         self.ownership_joined = self.ownership_joined and joined
         if not self.ownership_joined:
             self.results = self.replay = None
