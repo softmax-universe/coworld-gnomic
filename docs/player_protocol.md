@@ -4,8 +4,12 @@ Connect JSON-over-WebSocket to the URL in `COWORLD_PLAYER_WS_URL`. Every request
 has a unique `rid`; echo it in the response. Unknown server messages should be
 ignored. The SDK attaches the request ID. Model players return the fields shown
 for the current phase as one JSON object, bare or in one Markdown fence. An
-invalid or missing move ends the episode without scores. The operator log records
-the seat, phase, and cause, including rejected moves and provider failures.
+invalid or missing move ends the episode without scores and writes a typed
+`GamePlayerFailure` (`failed_policy_index`, `message`, `kind`) to
+`COGAME_PLAYER_FAILURE_URI` (`player_error` for illegal or missing moves,
+`episode_inconclusive` for provider or transport outages). The operator log
+records the seat, phase, and cause, including rejected moves and provider
+failures.
 
 The bundled `gnomic.players.sdk.Policy` exposes `introduce`, `action`,
 `propose`, `debate`, and `vote` callbacks for these same requests. The SDK

@@ -38,12 +38,17 @@ GNOME_SEAT_NAMES = ["Ivan", "Anton", "Yura"]
 Broadcast = Callable[[dict[str, Any]], Awaitable[None]]
 
 
+INCONCLUSIVE_FAILURE_REASONS = frozenset({"provider_error", "provider_timeout"})
+
+
 class PlayerMoveError(RuntimeError):
     """A seat failed to provide a valid protocol move during a decision phase."""
 
     def __init__(
         self, turn: int, phase: str, failures: list[dict[str, Any]]
     ) -> None:
+        if not failures:
+            raise ValueError("PlayerMoveError requires at least one failing seat")
         self.turn = turn
         self.phase = phase
         self.failures = sorted(failures, key=lambda item: item["seat"])
@@ -52,6 +57,28 @@ class PlayerMoveError(RuntimeError):
             f"seat {item['seat']} ({item['reason']})" for item in self.failures
         )
         super().__init__(f"Move failure in {phase} on turn {turn}: {summary}")
+
+    def player_failure_payload(self) -> dict[str, Any]:
+        """Return a closed Coworld GamePlayerFailure payload for this interruption."""
+        inconclusive = [
+            item
+            for item in self.failures
+            if item["reason"] in INCONCLUSIVE_FAILURE_REASONS
+        ]
+        primary = inconclusive[0] if inconclusive else self.failures[0]
+        kind = "episode_inconclusive" if inconclusive else "player_error"
+        details = "; ".join(
+            f"seat {item['seat']} ({item['reason']}): {item['detail']}"
+            for item in self.failures
+        )
+        message = f"Move failure in {self.phase} on turn {self.turn}: {details}"
+        if len(message) > 2000:
+            message = message[:1997] + "..."
+        return {
+            "failed_policy_index": int(primary["seat"]),
+            "message": message,
+            "kind": kind,
+        }
 
 
 def _draw_host_random(rng: random.Random) -> dict[str, Any]:
