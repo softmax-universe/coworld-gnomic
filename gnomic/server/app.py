@@ -219,6 +219,8 @@ class GameServer:
             )
             write_private_episode(os.environ["COGAME_SAVE_TRAJECTORY_URI"], record)
             self.private_written = True
+            if status == "completed" and record.episode.status != "completed":
+                raise RuntimeError("private episode has unresolved native ownership")
 
     def _write_interrupted(self) -> None:
         self._write_private("truncated", "ownership-interrupted")
@@ -240,11 +242,6 @@ class GameServer:
                 self.results = self.replay = None
                 self._write_interrupted()
                 raise RuntimeError("episode ownership remains unresolved")
-            private = self.episode.capture.finish()
-            if private.episode.status != "completed":
-                self.results = self.replay = None
-                self._write_interrupted()
-                raise RuntimeError("private episode has unresolved native ownership")
             self._write_private("completed")
             self._write_artifacts()
             await asyncio.gather(

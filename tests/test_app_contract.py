@@ -71,6 +71,9 @@ async def test_certification_probe_survives_fast_episode(tmp_path, monkeypatch) 
     exits once the client leaves."""
     import socket
 
+    from gnomic.players.baseline import BaselinePolicy
+    from gnomic.players.client import run_policy
+
     import uvicorn
     import websockets
 
@@ -87,7 +90,8 @@ async def test_certification_probe_survives_fast_episode(tmp_path, monkeypatch) 
                 "debate_window_s": 0.05,
                 "vote_window_s": 0.05,
                 "judge_window_s": 1,
-                "player_connect_timeout_seconds": 0.2,
+                "player_connect_timeout_seconds": 10,
+                "introduce_window_s": 0.05,
                 "episode_timeout_seconds": 60,
             }
         )
@@ -112,6 +116,12 @@ async def test_certification_probe_survives_fast_episode(tmp_path, monkeypatch) 
     async with websockets.connect(f"ws://127.0.0.1:{port}/global") as websocket:
         hello = json.loads(await asyncio.wait_for(websocket.recv(), 5))
         assert hello["type"] == "hello"
+        await asyncio.gather(*(
+            run_policy(BaselinePolicy(), f"ws://127.0.0.1:{port}/player?slot={slot}&token={token}")
+            for slot, token in enumerate(("a", "b", "c"))
+        ))
+        assert game.fatal_error is None
+        assert game.results is not None and sum(game.results["scores"]) == pytest.approx(1)
         while not game.done:
             await asyncio.sleep(0.05)
         await asyncio.sleep(1.5)  # past the old 1s grace in which the server used to exit
