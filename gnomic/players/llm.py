@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from gnomic.protocol import parse_reply_text
 from gnomic.prompts import PromptSelection
 from gnomic.llm_transport import complete_native
 
@@ -23,13 +23,6 @@ from .client import main
 
 MODEL = "anthropic/claude-opus-4.7"
 DEFAULT_MAX_TOKENS = 32_768
-OUTCOME = Literal["sole_win", "co_win", "continues", "loss", "uncertain"]
-
-_DECLARED_VOTE_RE = re.compile(
-    r"\b(?:i\s+vote|i\s+will\s+vote|i['’]ll\s+vote|i['’]m\s+voting|my\s+vote\s+is)\s+(aye|nay)\b",
-    re.IGNORECASE,
-)
-
 PERSONAS = {
     "ivan": (
         "You are Ivan, eldest gnome of House One in the village of Heartleaf: earnest, intense, ambitious, and "
@@ -58,7 +51,7 @@ class ActionOutput(BaseModel):
 
 class ProposalOutput(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True, extra="forbid")
-    kind: str
+    kind: Literal["enact", "amend", "repeal", "transmute"]
     text: str | None = Field(default=None, min_length=1, max_length=2_000)
     rule_id: int | None = None
     rationale: str = Field(default="", max_length=2_000)
@@ -73,48 +66,15 @@ class ProposalOutput(BaseModel):
 
 
 class DebateOutput(BaseModel):
-    model_config = ConfigDict(hide_input_in_errors=True, extra="forbid")
-    adoption_outcome: str = Field(min_length=1, max_length=600)
-    rejection_outcome: str = Field(min_length=1, max_length=600)
-    game_ends_if_adopted: bool
-    my_outcome_if_adopted: OUTCOME
-    my_outcome_if_rejected: OUTCOME
+    model_config = ConfigDict(extra="forbid")
     text: str = Field(min_length=1, max_length=2_000)
     vote_intent: Literal["aye", "nay"]
 
-    @model_validator(mode="after")
-    def decision_is_coherent(self) -> DebateOutput:
-        declarations = _DECLARED_VOTE_RE.findall(self.text)
-        if declarations and declarations[-1].lower() != self.vote_intent:
-            raise ValueError("public statement explicitly declares the opposite vote")
-        if (
-            self.game_ends_if_adopted
-            and self.my_outcome_if_adopted == "loss"
-            and self.vote_intent == "aye"
-        ):
-            raise ValueError("cannot vote AYE for an immediate own loss")
-        return self
-
 
 class VoteOutput(BaseModel):
-    model_config = ConfigDict(hide_input_in_errors=True, extra="forbid")
-    adoption_outcome: str = Field(min_length=1, max_length=600)
-    rejection_outcome: str = Field(min_length=1, max_length=600)
-    game_ends_if_adopted: bool
-    my_outcome_if_adopted: OUTCOME
-    my_outcome_if_rejected: OUTCOME
+    model_config = ConfigDict(extra="forbid")
     vote: Literal["aye", "nay"]
-    reason: str = Field(min_length=1, max_length=1_000)
-
-    @model_validator(mode="after")
-    def reject_immediate_own_loss(self) -> VoteOutput:
-        if (
-            self.game_ends_if_adopted
-            and self.my_outcome_if_adopted == "loss"
-            and self.vote == "aye"
-        ):
-            raise ValueError("cannot vote AYE for an immediate own loss")
-        return self
+    reason: str = Field(default="", max_length=1_000)
 
 
 def _clip_public(text: str, limit: int) -> str:
@@ -127,89 +87,6 @@ def _clip_public(text: str, limit: int) -> str:
         return prefix[: sentence_end + 1]
     word_end = prefix.rfind(" ")
     return (prefix[:word_end] if word_end >= limit // 2 else prefix).rstrip() + "…"
-
-
-def normalize_model_payload(
-    data: dict[str, Any], model: type[BaseModel]
-) -> dict[str, Any]:
-    """Map common harmless label synonyms before strict schema validation."""
-    normalized = dict(data)
-    normalized.pop("default", None)
-    if model is ActionOutput:
-        if "action" not in normalized and isinstance(normalized.get("text"), str):
-            normalized["action"] = normalized.pop("text")
-        if isinstance(normalized.get("action"), str):
-            normalized["action"] = _clip_public(normalized["action"], 2_000)
-    elif model is ProposalOutput:
-        if isinstance(normalized.get("proposal"), dict):
-            normalized = dict(normalized["proposal"])
-            normalized.pop("default", None)
-        if "text" not in normalized:
-            for alias in ("rule_text", "proposal_text", "rule"):
-                if isinstance(normalized.get(alias), str):
-                    normalized["text"] = normalized.pop(alias)
-                    break
-        if "kind" not in normalized and isinstance(normalized.get("action"), str):
-            normalized["kind"] = normalized.pop("action")
-        if isinstance(normalized.get("text"), str):
-            normalized["text"] = _clip_public(normalized["text"], 2_000)
-        if isinstance(normalized.get("rationale"), str):
-            normalized["rationale"] = _clip_public(normalized["rationale"], 2_000)
-    elif model is DebateOutput:
-        if "text" not in normalized:
-            for alias in (
-                "public_statement",
-                "debate_statement",
-                "statement",
-                "debate",
-                "argument",
-                "case_for",
-                "case_against",
-            ):
-                if isinstance(normalized.get(alias), str):
-                    normalized["text"] = normalized.pop(alias)
-                    break
-        if "text" not in normalized:
-            # Accept one otherwise-unknown non-decision string as the statement,
-            # then let the strict model reject remaining extras or malformed data.
-            reserved = {
-                "vote_intent",
-                "adoption_outcome",
-                "rejection_outcome",
-                "my_outcome_if_adopted",
-                "my_outcome_if_rejected",
-            }
-            candidates = [
-                key
-                for key, value in normalized.items()
-                if key not in reserved and isinstance(value, str)
-            ]
-            if len(candidates) == 1:
-                normalized["text"] = normalized.pop(candidates[0])
-        if "vote_intent" not in normalized and isinstance(normalized.get("vote"), str):
-            normalized["vote_intent"] = normalized.pop("vote")
-        for key in ("adoption_outcome", "rejection_outcome"):
-            if isinstance(normalized.get(key), str):
-                normalized[key] = _clip_public(normalized[key], 600)
-        if isinstance(normalized.get("text"), str):
-            normalized["text"] = _clip_public(normalized["text"], 2_000)
-    elif model is VoteOutput:
-        if "reason" not in normalized:
-            for alias in ("strategic_reason", "rationale", "explanation"):
-                if isinstance(normalized.get(alias), str):
-                    normalized["reason"] = normalized.pop(alias)
-                    break
-        for key in ("adoption_outcome", "rejection_outcome"):
-            if isinstance(normalized.get(key), str):
-                normalized[key] = _clip_public(normalized[key], 600)
-        if isinstance(normalized.get("reason"), str):
-            normalized["reason"] = _clip_public(normalized["reason"], 1_000)
-    # Opus sometimes supplies useful self-check fields in addition to the exact
-    # requested object (for example ``my_intent`` or ``my_intent_matches``).
-    # Once all required public fields are present, those annotations are harmless;
-    # discard them rather than spending a second call and eventually defaulting.
-    allowed = set(model.model_fields)
-    return {key: value for key, value in normalized.items() if key in allowed}
 
 
 class OpusPolicy:
@@ -263,33 +140,13 @@ class OpusPolicy:
             raise ValueError("model returned no text content")
         return payload.text
 
-    @staticmethod
-    def _json(text: str) -> dict[str, Any]:
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end <= start:
-            raise ValueError("no JSON object")
-        value = json.loads(text[start : end + 1])
-        if not isinstance(value, dict):
-            raise ValueError("response was not an object")
-        return value
-
     async def _complete(
         self, system: str, prompt: str, model: type[BaseModel]
     ) -> BaseModel:
-        last: Exception | None = None
-        repair = ""
-        for attempt in range(2):
-            try:
-                text = await self._invoke(system, prompt + repair)
-                return model.model_validate(
-                    normalize_model_payload(self._json(text), model)
-                )
-            except (ValueError, json.JSONDecodeError, ValidationError) as exc:
-                last = exc
-                if "model returned no text content" in str(exc):
-                    break
-                repair = f"\nYour previous response was invalid ({exc}). Return corrected JSON only."
-        raise RuntimeError(f"Opus policy returned invalid JSON twice: {last}")
+        parsed = parse_reply_text(await self._invoke(system, prompt))
+        if parsed.kind == "invalid":
+            raise ValueError(f"Invalid model reply: {parsed.error}")
+        return model.model_validate(parsed.value)
 
     def _system(self) -> str:
         constraints = "\n".join(f"- {item}" for item in self.host_constraints)
@@ -639,16 +496,8 @@ phase. In particular, debates are parallel and have no mutable debate order."""
                 },
                 ensure_ascii=False,
             )
-            try:
-                result = await self._complete(self._system(), prompt, ActionOutput)
-                return {"rid": message["rid"], "action": result.action}
-            except Exception as exc:
-                print(
-                    f"[gnomic-player] action fallback: {exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                return {"rid": message["rid"], "action": "pass"}
+            result = await self._complete(self._system(), prompt, ActionOutput)
+            return {"rid": message["rid"], "action": result.action}
         if kind == "proposal_request":
             turn = int(message["turn"])
             prompt = json.dumps(
@@ -672,26 +521,9 @@ phase. In particular, debates are parallel and have no mutable debate order."""
                 },
                 ensure_ascii=False,
             )
-            try:
-                result = await self._complete(self._system(), prompt, ProposalOutput)
-                data = result.model_dump(exclude_none=True)
-                if data["kind"] not in {"enact", "amend", "repeal", "transmute"}:
-                    raise ValueError("invalid proposal kind")
-                return {"rid": message["rid"], "proposal": data}
-            except Exception as exc:
-                print(
-                    f"[gnomic-player] proposal fallback: {exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                return {
-                    "rid": message["rid"],
-                    "proposal": {
-                        "kind": "enact",
-                        "text": "Players should prefer rules that preserve a clear path to victory.",
-                        "rationale": "Safe fallback proposal.",
-                    },
-                }
+            result = await self._complete(self._system(), prompt, ProposalOutput)
+            data = result.model_dump(exclude_none=True)
+            return {"rid": message["rid"], "proposal": data}
         if kind == "debate_request":
             turn = int(message["turn"])
             proposer = int(message.get("proposer", self.proposer))
@@ -711,41 +543,21 @@ phase. In particular, debates are parallel and have no mutable debate order."""
                     "proposal": message["proposal"],
                     "recent_public_history": self.history[-16:],
                     "format": {
-                        "adoption_outcome": "concise concrete state/winner consequence",
-                        "rejection_outcome": "concise concrete state/winner consequence",
-                        "game_ends_if_adopted": "boolean",
-                        "my_outcome_if_adopted": "sole_win|co_win|continues|loss|uncertain",
-                        "my_outcome_if_rejected": "sole_win|co_win|continues|loss|uncertain",
                         "text": "public argument",
                         "vote_intent": "aye|nay",
                     },
                 },
                 ensure_ascii=False,
             )
-            try:
-                result = await self._complete(self._system(), prompt, DebateOutput)
-                data = result.model_dump()
-                intent = data["vote_intent"].lower()
-                if intent not in {"aye", "nay"}:
-                    raise ValueError("invalid vote intent")
-                self.vote_intents[int(message["turn"])] = intent
-                return {
-                    "rid": message["rid"],
-                    "text": data["text"],
-                    "vote_intent": intent,
-                }
-            except Exception as exc:
-                print(
-                    f"[gnomic-player] debate fallback: {exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                self.vote_intents[int(message["turn"])] = "nay"
-                return {
-                    "rid": message["rid"],
-                    "text": "I cannot support this proposal confidently.",
-                    "vote_intent": "nay",
-                }
+            result = await self._complete(self._system(), prompt, DebateOutput)
+            data = result.model_dump()
+            intent = data["vote_intent"].lower()
+            self.vote_intents[int(message["turn"])] = intent
+            return {
+                "rid": message["rid"],
+                "text": data["text"],
+                "vote_intent": intent,
+            }
         if kind == "vote_request":
             turn = int(message["turn"])
             self.current_votes_required = int(
@@ -771,34 +583,19 @@ phase. In particular, debates are parallel and have no mutable debate order."""
                     "preliminary_vote_intent": self.vote_intents.get(turn, "nay"),
                     "recent_public_history": self.history[-16:],
                     "format": {
-                        "adoption_outcome": "concise concrete state/winner consequence",
-                        "rejection_outcome": "concise concrete state/winner consequence",
-                        "game_ends_if_adopted": "boolean",
-                        "my_outcome_if_adopted": "sole_win|co_win|continues|loss|uncertain",
-                        "my_outcome_if_rejected": "sole_win|co_win|continues|loss|uncertain",
                         "vote": "aye|nay",
                         "reason": "short reason revealed with the vote; at most 900 characters",
                     },
                 },
                 ensure_ascii=False,
             )
-            try:
-                result = await self._complete(self._system(), prompt, VoteOutput)
-                data = result.model_dump()
-                return {
-                    "rid": message["rid"],
-                    "vote": data["vote"],
-                    "reason": data["reason"],
-                }
-            except Exception as exc:
-                print(
-                    f"[gnomic-player] vote fallback: {exc}", file=sys.stderr, flush=True
-                )
-                return {
-                    "rid": message["rid"],
-                    "vote": "nay",
-                    "reason": "Could not verify that adoption preserves my path to victory.",
-                }
+            result = await self._complete(self._system(), prompt, VoteOutput)
+            data = result.model_dump()
+            return {
+                "rid": message["rid"],
+                "vote": data["vote"],
+                "reason": data["reason"],
+            }
         if kind == "final":
             print(
                 f"[gnomic-player] usage={json.dumps(self.usage)}",

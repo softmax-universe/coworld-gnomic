@@ -260,12 +260,15 @@ class GameServer:
             await self._join_ownership()
             self.results = self.replay = None
             self.fatal_error = type(exc).__name__
-            self.done = True
             self._write_private(
                 "failed" if self.ownership_joined else "truncated", type(exc).__name__
             )
             self._write_operator_log()
+            await asyncio.gather(
+                *(c.send({"type": "final", "scores": None}) for c in channels)
+            )
             await self.broadcast({"type": "fatal_error", "error": self.fatal_error})
+            self.done = True
         finally:
             await self._join_ownership()
             if self.stopping and not self.private_written:

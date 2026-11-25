@@ -2,7 +2,10 @@
 
 Connect JSON-over-WebSocket to the URL in `COWORLD_PLAYER_WS_URL`. Every request
 has a unique `rid`; echo it in the response. Unknown server messages should be
-ignored. Late, malformed, or missing actions receive deterministic defaults.
+ignored. The SDK attaches the request ID. Model players return the fields shown
+for the current phase as one JSON object, bare or in one Markdown fence. An
+invalid or missing move ends the episode without scores. The operator log records
+the seat, phase, and cause, including rejected moves and provider failures.
 
 The bundled `gnomic.players.sdk.Policy` exposes `introduce`, `action`,
 `propose`, `debate`, and `vote` callbacks for these same requests. The SDK
@@ -66,5 +69,4 @@ statement until both windows close.
 {"rid":4,"vote":"nay","reason":"Private reason"}
 ```
 
-Votes are hidden until all three replies/defaults are collected. A malformed or
-missing vote is NAY.
+Votes are hidden while the simultaneous voting windows are open. A malformed or missing vote is a player failure.

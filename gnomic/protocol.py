@@ -205,6 +205,13 @@ class ParsedReply(BaseModel):
 
 def parse_reply_text(text: str) -> ParsedReply:
     """Player text is untrusted protocol data; expose an explicit parse outcome."""
+    lines = text.strip().splitlines()
+    if (
+        len(lines) >= 3
+        and lines[0].lower() in {"```", "```json"}
+        and lines[-1] == "```"
+    ):
+        text = "\n".join(lines[1:-1])
     try:
         value = json.loads(text)
         if not isinstance(value, dict):

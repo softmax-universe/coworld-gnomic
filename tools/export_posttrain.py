@@ -56,7 +56,7 @@ async def collect(
             await channel.send({"type": "final", "scores": results["scores"]})
         if not await settle(set(tasks), deadline, cancel=False):
             raise OwnershipUnsettled("collector player shutdown unresolved")
-        assert all(not session.defaults for session in sessions)
+        assert all(not session.failures for session in sessions)
         assert all(
             not event["action"]["default"]
             for event in replay["events"]

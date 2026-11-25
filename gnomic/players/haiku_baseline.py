@@ -1,18 +1,14 @@
 """Haiku baseline: minimal LLM player through Coworld native Messages.
 
 Reads the learner model override from ``COWORLD_LLM_MODEL``.
-Every model call is bounded and falls back to the deterministic scribe move on any
-error, so a blocked call never times out the episode. Read this as the tutorial
-for building your own LLM player.
+A failed model call is surfaced to the game.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import sys
 
-from gnomic.lifecycle import OwnershipUnsettled
 from gnomic.llm_transport import complete_native
 
 from .scribe import ScribePolicy
@@ -33,32 +29,20 @@ class LlmClient:
         self.model_id = os.environ.get(
             "COWORLD_LLM_MODEL", "anthropic/claude-haiku-4.5"
         )
-        self._logged = set()
 
-    def _log_once(self, key: str, message: str) -> None:
-        if key not in self._logged:
-            print(message, file=sys.stderr, flush=True)
-            self._logged.add(key)
-
-    async def complete(self, system: str, user: str, *, max_tokens: int) -> str | None:
+    async def complete(self, system: str, user: str, *, max_tokens: int) -> str:
         body = {
             "max_tokens": max_tokens,
             "system": system,
             "messages": [{"role": "user", "content": user}],
         }
-        try:
-            payload = await complete_native(
-                body, self.model_id, purpose="learner", timeout=120
-            )
-            self._log_once("ok", f"[native] using the model ({self.model_id})")
-            return payload.text.strip() or None
-        except (
-            Exception
-        ) as e:  # existing baseline fallback remains visible in private capture
-            if isinstance(e, OwnershipUnsettled):
-                raise
-            self._log_once("fallback", f"[native] fell back: {type(e).__name__}")
-            return None
+        payload = await complete_native(
+            body, self.model_id, purpose="learner", timeout=120
+        )
+        text = payload.text.strip()
+        if not text:
+            raise ValueError("model returned empty text")
+        return text
 
 
 def _context(view: GameView) -> str:
@@ -78,7 +62,7 @@ def _context(view: GameView) -> str:
 
 
 class HaikuPolicy(Policy):
-    """LLM moves with scribe as the always-legal fallback."""
+    """Haiku writes proposals, debate statements and votes."""
 
     def __init__(self) -> None:
         self.client = LlmClient()
@@ -122,13 +106,11 @@ class HaikuPolicy(Policy):
             + _context(view),
             max_tokens=150,
         )
-        if out:
-            return {
-                "kind": "enact",
-                "text": out,
-                "rationale": "Haiku baseline proposal.",
-            }
-        return self.baseline.propose(view)
+        return {
+            "kind": "enact",
+            "text": out,
+            "rationale": "Haiku baseline proposal.",
+        }
 
     async def debate(self, view: GameView) -> dict:
         out = await self.client.complete(
@@ -137,10 +119,8 @@ class HaikuPolicy(Policy):
             "Reply with ONLY your statement.\n\nGame context:\n" + _context(view),
             max_tokens=120,
         )
-        if out:
-            support = self.baseline._supports(view)
-            return {"text": out, "vote_intent": "aye" if support else "nay"}
-        return self.baseline.debate(view)
+        support = self.baseline._supports(view)
+        return {"text": out, "vote_intent": "aye" if support else "nay"}
 
     async def vote(self, view: GameView) -> str:
         out = await self.client.complete(
@@ -149,11 +129,10 @@ class HaikuPolicy(Policy):
             "Game context:\n" + _context(view),
             max_tokens=8,
         )
-        if out:
-            word = out.strip().lower().split()[0].strip(".,!\"'")
-            if word in ("aye", "nay"):
-                return word
-        return self.baseline.vote(view)
+        vote = out.lower()
+        if vote not in {"aye", "nay"}:
+            raise ValueError("vote must be aye or nay")
+        return vote
 
 
 if __name__ == "__main__":

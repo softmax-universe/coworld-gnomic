@@ -30,7 +30,7 @@ class RequestWindow(BaseModel):
     attempts: dict[str, Attempt] = Field(default_factory=dict)
     submitted: JsonValue = None
     executed: JsonValue = None
-    fallback: bool = True
+    fallback: bool = False
     closed: bool = False
 
 
@@ -145,7 +145,12 @@ class Capture:
         return None
 
     def consumed(
-        self, seat: int, rid: int, raw: dict | None, action: dict, fallback: bool
+        self,
+        seat: int,
+        rid: int,
+        raw: dict | None,
+        action: dict | None,
+        fallback: bool,
     ) -> None:
         if self.sealed:
             raise RuntimeError("engine action after private seal")
@@ -157,9 +162,10 @@ class Capture:
         if (
             seat in self.teacher_seats
             and not fallback
+            and action is not None
             and window.request["type"] != "introduce_request"
         ):
-            response = json.dumps({"rid": rid, **action}, ensure_ascii=False)
+            response = json.dumps(action, ensure_ascii=False)
             attempt = Attempt(
                 policy="scripted-scribe",
                 origin="teacher",
@@ -219,20 +225,27 @@ class Capture:
                     continue
                 decoded = parsed.value
                 assert decoded is not None
-                if decoded.get("rid") != rid:
-                    attempt.rejection_reason = "response-request-mismatch"
+                canonical = Episode.canonical_action(window.request, seat, decoded)
+                if canonical is None:
+                    attempt.rejection_reason = "invalid-action-payload"
                     continue
-                attempt.parsed_action = Episode.canonical_action(
-                    window.request, seat, decoded
-                )
-                if attempt.parsed_action == window.executed and not window.fallback:
+                attempt.parsed_action = canonical
+                if (
+                    window.executed is not None
+                    and attempt.parsed_action == window.executed
+                    and not window.fallback
+                ):
                     selected = attempt
                 else:
                     attempt.rejection_reason = "parser-execution-mismatch"
-            if selected is not None and not window.fallback:
+            if (
+                selected is not None
+                and not window.fallback
+                and window.executed is not None
+            ):
                 selected.accepted = True
                 selected.rejection_reason = None
-            if not attempts:
+            if not attempts and (window.fallback or window.executed is not None):
                 attempt = Attempt(
                     policy=ep.config.players[seat].name,
                     origin="fallback" if window.fallback else "unknown",
@@ -249,7 +262,7 @@ class Capture:
                 "fallback"
                 if window.fallback
                 else "accepted"
-                if selected is not None
+                if selected is not None and window.executed is not None
                 else "rejected"
             )
             decisions.append(
@@ -300,6 +313,7 @@ class Capture:
                     "results": ep.results,
                     "config": ep.config.model_dump(exclude={"tokens"}),
                     "failure_kind": failure_kind,
+                    "move_failure": ep.move_failure,
                     "ownership_joined": ownership_joined,
                     "ingress_issues": self.ingress_issues,
                     "received_header_pairs": [

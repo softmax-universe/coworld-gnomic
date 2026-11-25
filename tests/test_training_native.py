@@ -21,7 +21,7 @@ import websockets
 from gnomic.judge import ACTION_JUDGE_SYSTEM, JUDGE_SYSTEM
 from gnomic.llm_transport import Attempt, complete_native
 from gnomic.players.native import NativePolicy
-from gnomic.players.posttrain_prompt import REPLY_PROTOCOL
+from gnomic.players.posttrain_prompt import REPLIES
 from gnomic.players.scribe import ScribePolicy
 from gnomic.players.sdk import GameView, run_ws_player
 from gnomic.server.app import GameServer, build_app
@@ -118,7 +118,7 @@ def fixture_reply(observation: dict) -> dict:
         result = {"vote": policy.vote(view)}
     else:
         raise AssertionError(kind)
-    return {"rid": request["rid"], **result}
+    return result
 
 
 @pytest.mark.parametrize(
@@ -357,8 +357,8 @@ async def test_native_episode_retains_exact_calls_and_freezes_elder(
                         event = json.loads(raw)
                         archive.write(json.dumps(event) + "\n")
                         assert not any(key.startswith("private") for key in event)
-                        if event["type"] == "final":
-                            return
+                        if event["type"] in {"final", "fatal_error"}:
+                            return event["type"]
 
         observer = asyncio.create_task(observe())
         await asyncio.sleep(0)
@@ -372,13 +372,9 @@ async def test_native_episode_retains_exact_calls_and_freezes_elder(
             for seat, token in enumerate(config["tokens"])
         ]
         await asyncio.wait_for(asyncio.gather(*players), 180 if turns == 45 else 30)
-        await asyncio.wait_for(observer, 5)
+        terminal_event = await asyncio.wait_for(observer, 5)
         await asyncio.wait_for(task, 10)
-        assert game.results is not None and game.replay is not None
-        (tmp_path / "results.json").write_text(json.dumps(game.results))
-        (tmp_path / "replay.json").write_text(json.dumps(game.replay))
         episode = TrainingEpisode.model_validate_json(output.read_text())
-        assert episode.episode.status == "completed"
         assert not episode.episode.outcome["ingress_issues"]
         assert output.stat().st_mode & 0o777 == 0o600
         assert output.parent.stat().st_mode & 0o777 == 0o700
@@ -386,8 +382,14 @@ async def test_native_episode_retains_exact_calls_and_freezes_elder(
             a for d in episode.decisions for a in d.attempts if a.origin == "model"
         ]
         assert generated
-        assert all(a.request["system"].endswith(REPLY_PROTOCOL) for a in generated)
-        assert '"action": "your natural-language action"' in REPLY_PROTOCOL
+        assert all(
+            a.request["system"].endswith(
+                REPLIES[
+                    json.loads(a.request["messages"][0]["content"])["request"]["type"]
+                ]
+            )
+            for a in generated
+        )
         environmental = [
             Attempt.model_validate(a)
             for a in episode.episode.outcome["environment_generations"]
@@ -423,6 +425,11 @@ async def test_native_episode_retains_exact_calls_and_freezes_elder(
                 for a in generated
             )
         if mode in {"accepted", "sampled", "greedy", "context_metadata", "checkpoint"}:
+            assert terminal_event == "final"
+            assert game.results is not None and game.replay is not None
+            (tmp_path / "results.json").write_text(json.dumps(game.results))
+            (tmp_path / "replay.json").write_text(json.dumps(game.replay))
+            assert episode.episode.status == "completed"
             assert all(d.action_status == "accepted" for d in episode.decisions)
             assert any(
                 d.observation["view"]["request"]["type"] == "action_repair_request"
@@ -434,18 +441,60 @@ async def test_native_episode_retains_exact_calls_and_freezes_elder(
                 for a in d.attempts
                 if a.attempt_id == d.selected_attempt_id
             )
+            assert all(
+                not key.startswith("private")
+                for event in game.replay["events"]
+                for key in event
+            )
         else:
+            assert terminal_event == "fatal_error"
+            assert game.results is None and game.replay is None
+            assert game.fatal_error == "PlayerMoveError"
+            assert episode.episode.status == "failed"
+            assert episode.episode.outcome["failure_kind"] == "PlayerMoveError"
+            assert episode.episode.outcome["results"] is None
+            assert episode.episode.participant_outcomes == {
+                "0": {"score": None},
+                "1": {"score": None},
+                "2": {"score": None},
+            }
+            assert all(
+                d.reward is None and d.terminal is False for d in episode.decisions
+            )
             assert all(not a.accepted for a in generated)
-            assert all(d.action_status == "fallback" for d in episode.decisions)
-        assert all(
-            not key.startswith("private")
-            for event in game.replay["events"]
-            for key in event
-        )
+            intro_decisions = [
+                d
+                for d in episode.decisions
+                if d.observation["view"]["request"]["type"] == "introduce_request"
+            ]
+            move_decisions = [
+                d
+                for d in episode.decisions
+                if d.observation["view"]["request"]["type"] != "introduce_request"
+            ]
+            assert all(d.action_status == "fallback" for d in intro_decisions)
+            assert move_decisions and all(
+                d.action_status == "rejected"
+                and d.executed_action is None
+                and d.selected_attempt_id is None
+                and d.fallback_origin is None
+                for d in move_decisions
+            )
+            move_failure = episode.episode.outcome["move_failure"]
+            assert move_failure["phase"] == "action"
+            assert move_failure["failed_seats"] == [0]
+            expected_reason = (
+                "invalid_model_reply" if mode == "malformed" else "provider_error"
+            )
+            assert move_failure["failures"][0]["reason"] == expected_reason
+            assert game.episode is not None
+            assert game.episode.operator_log()["move_failure"] == move_failure
         (tmp_path / "attempt-complete.json").write_text(
             json.dumps(
                 {
-                    "turns_played": game.results["turns_played"],
+                    "turns_played": game.results["turns_played"]
+                    if game.results is not None
+                    else 0,
                     "HTTP_calls": len(calls),
                     "decisions": len(episode.decisions),
                     "status": episode.episode.status,
@@ -630,7 +679,7 @@ async def test_private_ingress_is_immutable_seat_bound_and_sealed(monkeypatch):
     assert snapshot.episode.status == "truncated"
     assert snapshot.decisions[0].attempts[0].latency_ms is None
     completed = started.model_copy(
-        update={"latency_ms": 20, "response": '{"rid":1,"action":"pass"}'}
+        update={"latency_ms": 20, "response": '{"action":"pass"}'}
     )
     episode.capture.receive(0, {**packet, "attempt": completed.model_dump(mode="json")})
     assert (
@@ -666,7 +715,7 @@ async def test_external_teacher_claim_does_not_become_training_target(monkeypatc
         request=None,
         model=None,
         decoder=None,
-        response='{"rid":1,"action":"pass"}',
+        response='{"action":"pass"}',
         accepted=True,
         parsed_action={"action": "forged"},
     )
@@ -708,3 +757,152 @@ async def test_checkpoint_native_full_45_turn_game_preserves_elder_and_private_e
         for a in d.attempts
         if a.origin == "model"
     )
+
+
+async def test_teacher_response_omits_rid_and_model_rejects_rid_or_extras(monkeypatch):
+    from gnomic.server.channel import InProcessChannel
+    from gnomic.server.config import GameConfig
+    from gnomic.server.episode import Episode
+
+    monkeypatch.setenv("COWORLD_EPISODE_ID", "rid-contract")
+    monkeypatch.setenv("COWORLD_SOURCE_REVISION", "d" * 40)
+    monkeypatch.setenv("COWORLD_GAME_VERSION", "fixture-source")
+    episode = Episode(
+        GameConfig(
+            tokens=["a", "b", "c"],
+            players=[{"name": "test"} for _ in range(3)],
+            judge_mode="deterministic",
+        ),
+        [InProcessChannel(s) for s in range(3)],
+        seed=1,
+        teacher_seats=frozenset({0}),
+    )
+    # Seat 0 teacher decision omits rid in teacher response JSON.
+    await episode._send(
+        episode.channels[0],
+        {"type": "action_request", "rid": 1, "turn": 1, "timeout_s": 5},
+    )
+    episode.capture.consumed(
+        0, 1, {"rid": 1, "action": "pass"}, {"action": "pass"}, False
+    )
+    # Seat 1 model decision rejects old rid and extra keys.
+    await episode._send(
+        episode.channels[1],
+        {
+            "type": "vote_request",
+            "rid": 2,
+            "turn": 1,
+            "timeout_s": 5,
+            "proposal": {},
+            "debates": [],
+        },
+    )
+    window = episode.capture.windows[(1, 2)]
+    bad_attempt = Attempt(
+        policy="native",
+        origin="model",
+        prompt=window.prompt,
+        request={"model": "fixture", "messages": window.prompt},
+        model="fixture",
+        decoder={"temperature": 0},
+        raw_response='{"content":[{"type":"text","text":"{\\"rid\\":2,\\"vote\\":\\"aye\\"}"}]}',
+        response='{"rid":2,"vote":"aye"}',
+        platform_call_id=uuid4(),
+        response_complete=True,
+        response_reader_joined=True,
+        latency_ms=10.0,
+    )
+    episode.capture.receive(
+        1,
+        {
+            "type": "private_attempt",
+            "rid": 2,
+            "attempt": bad_attempt.model_dump(mode="json"),
+        },
+    )
+    episode.capture.consumed(1, 2, {"rid": 2, "vote": "aye"}, {"vote": "aye"}, False)
+
+    record = episode.capture.finish()
+    teacher_attempt = record.decisions[0].attempts[0]
+    assert teacher_attempt.origin == "teacher"
+    assert json.loads(teacher_attempt.response) == {"action": "pass"}
+    assert "rid" not in json.loads(teacher_attempt.response)
+
+    model_decision = record.decisions[1]
+    assert model_decision.action_status == "rejected"
+    assert model_decision.selected_attempt_id is None
+    assert model_decision.attempts[0].accepted is False
+    assert model_decision.attempts[0].rejection_reason == "invalid-action-payload"
+
+
+async def test_failed_episode_distinguishes_provider_timeout_and_leaves_rewards_missing(
+    monkeypatch,
+):
+    from gnomic.server.channel import InProcessChannel
+    from gnomic.server.config import GameConfig
+    from gnomic.server.episode import Episode, PlayerMoveError
+
+    monkeypatch.setenv("COWORLD_EPISODE_ID", "provider-timeout")
+    monkeypatch.setenv("COWORLD_SOURCE_REVISION", "d" * 40)
+    monkeypatch.setenv("COWORLD_GAME_VERSION", "fixture-source")
+    channels = [InProcessChannel(s) for s in range(3)]
+    episode = Episode(
+        GameConfig(
+            tokens=["a", "b", "c"],
+            players=[{"name": "native"} for _ in range(3)],
+            judge_mode="deterministic",
+            action_window_s=0.05,
+        ),
+        channels,
+        seed=2,
+    )
+    request = {"type": "action_request", "rid": 1, "turn": 1, "timeout_s": 0.05}
+    await episode._send(channels[0], request)
+    window = episode.capture.windows[(0, 1)]
+    timed_out = Attempt(
+        policy="NativePolicy",
+        origin="model",
+        prompt=window.prompt,
+        request={"model": "fixture", "messages": window.prompt},
+        model="fixture",
+        decoder={"temperature": 0},
+        response_complete=False,
+        response_reader_joined=True,
+        latency_ms=50.0,
+        rejection_reason="TimeoutError",
+    )
+    episode.capture.receive(
+        0,
+        {
+            "type": "private_attempt",
+            "rid": 1,
+            "attempt": timed_out.model_dump(mode="json"),
+        },
+    )
+    entry = episode._failure_entry(channels[0], 1, None, "invalid action")
+    assert entry["reason"] == "provider_timeout"
+    episode.capture.consumed(0, 1, None, None, False)
+    with pytest.raises(PlayerMoveError):
+        episode._raise_move_failure(1, "action", [entry])
+
+    record = episode.capture.finish(
+        status="failed", failure_kind="PlayerMoveError", ownership_joined=True
+    )
+    assert record.episode.status == "failed"
+    assert record.episode.outcome["results"] is None
+    assert (
+        record.episode.outcome["move_failure"]["failures"][0]["reason"]
+        == "provider_timeout"
+    )
+    assert record.episode.participant_outcomes == {
+        "0": {"score": None},
+        "1": {"score": None},
+        "2": {"score": None},
+    }
+    decision = record.decisions[0]
+    assert decision.action_status == "rejected"
+    assert decision.executed_action is None
+    assert decision.selected_attempt_id is None
+    assert decision.fallback_origin is None
+    assert decision.reward is None
+    assert decision.terminal is False

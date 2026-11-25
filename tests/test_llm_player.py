@@ -7,11 +7,7 @@ import pytest
 
 from gnomic.players.llm import (
     ActionOutput,
-    DebateOutput,
     OpusPolicy,
-    ProposalOutput,
-    VoteOutput,
-    normalize_model_payload,
 )
 
 
@@ -50,86 +46,22 @@ async def test_opus_player_request_uses_adaptive_high_with_native_reasoning(
     assert policy.usage == {"calls": 1, "input_tokens": 3, "output_tokens": 4}
 
 
-def test_common_json_key_synonyms_normalize_before_strict_validation() -> None:
-    context = {
-        "adoption_outcome": "The game continues.",
-        "rejection_outcome": "The game continues.",
-        "game_ends_if_adopted": False,
-        "my_outcome_if_adopted": "continues",
-        "my_outcome_if_rejected": "continues",
-    }
-    action = normalize_model_payload({"text": "I ring the bell."}, ActionOutput)
-    assert ActionOutput.model_validate(action).action == "I ring the bell."
-    debate = normalize_model_payload(
-        {**context, "public_statement": "This helps us.", "vote_intent": "aye"},
-        DebateOutput,
-    )
-    assert DebateOutput.model_validate(debate).text == "This helps us."
-    invented = normalize_model_payload(
-        {
-            **context,
-            "case_against": "This helps only the proposer.",
-            "vote_intent": "nay",
-        },
-        DebateOutput,
-    )
-    assert DebateOutput.model_validate(invented).text == "This helps only the proposer."
-    proposal = normalize_model_payload(
-        {
-            "proposal": {
-                "action": "enact",
-                "rule_text": "Tea is served.",
-                "rationale": "x" * 2_100,
-                "default": False,
-            }
-        },
-        ProposalOutput,
-    )
-    parsed = ProposalOutput.model_validate(proposal)
-    assert parsed.kind == "enact"
-    assert parsed.text == "Tea is served."
-    assert len(parsed.rationale) == 2_000
-    assert parsed.rationale.endswith("…")
-
-    vote = normalize_model_payload(
-        {
-            **context,
-            "vote": "nay",
-            "reason": "The proposal creates an immediate loss.",
-            "my_intent": "nay",
-            "my_intent_matches": True,
-        },
-        VoteOutput,
-    )
-    assert VoteOutput.model_validate(vote).vote == "nay"
-    assert "my_intent" not in vote
-    assert "my_intent_matches" not in vote
-
-
-def test_debate_rejects_explicit_vote_contradiction() -> None:
-    with pytest.raises(ValueError, match="opposite vote"):
-        DebateOutput(
-            adoption_outcome="Seat 1 wins immediately.",
-            rejection_outcome="All seats remain tied.",
-            game_ends_if_adopted=True,
-            my_outcome_if_adopted="loss",
-            my_outcome_if_rejected="co_win",
-            text="This makes seat 1 win at my expense, so I vote NAY.",
-            vote_intent="aye",
-        )
-
-
-def test_vote_rejects_immediate_own_loss() -> None:
-    with pytest.raises(ValueError, match="immediate own loss"):
-        VoteOutput(
-            adoption_outcome="Seat 1 wins immediately.",
-            rejection_outcome="All seats remain tied.",
-            game_ends_if_adopted=True,
-            my_outcome_if_adopted="loss",
-            my_outcome_if_rejected="co_win",
-            vote="aye",
-            reason="Support the opponent anyway.",
-        )
+@pytest.mark.asyncio
+async def test_action_reader_uses_one_object_and_never_plays_a_substitute(monkeypatch):
+    fake = FakeNative('```json\n{"action":"I ring the bell."}\n```')
+    monkeypatch.setattr("gnomic.players.llm.complete_native", fake.complete)
+    policy = OpusPolicy("ivan")
+    assert (
+        await policy._complete("system", "prompt", ActionOutput)
+    ).action == "I ring the bell."
+    for malformed in (
+        '{"text":"invented alias"}',
+        '{"action":"first"} {"action":"second"}',
+    ):
+        fake.text = malformed
+        with pytest.raises(ValueError):
+            await policy._complete("system", "prompt", ActionOutput)
+    assert policy.usage["calls"] == 3
 
 
 @pytest.mark.asyncio
@@ -163,11 +95,6 @@ async def test_final_vote_reasons_fresh_instead_of_reusing_debate_intent(
     fake = FakeNative(
         json.dumps(
             {
-                "adoption_outcome": "Seat 1 reaches the threshold and wins immediately.",
-                "rejection_outcome": "The game continues to the final turn.",
-                "game_ends_if_adopted": True,
-                "my_outcome_if_adopted": "loss",
-                "my_outcome_if_rejected": "continues",
                 "vote": "nay",
                 "reason": "Adoption would immediately eliminate my winning path.",
             }
