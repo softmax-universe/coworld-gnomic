@@ -10,7 +10,7 @@ from typing import Any, Protocol
 
 import websockets
 
-from gnomic.lifecycle import bounded, main_owned, player_loop
+from gnomic.lifecycle import OwnershipUnsettled, bounded, main_owned, player_loop
 from gnomic.llm_transport import AttemptPublisher, LearnerWindow, current_window
 
 
@@ -44,6 +44,12 @@ async def run_policy(policy: Policy, url: str | None = None) -> None:
             )
         try:
             reply = await policy.respond(message)
+        except OwnershipUnsettled:
+            raise
+        except Exception:
+            if "rid" not in message:
+                raise
+            reply = {"rid": message["rid"]}
         finally:
             if token is not None:
                 current_window.reset(token)

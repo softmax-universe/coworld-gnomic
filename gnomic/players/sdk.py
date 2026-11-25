@@ -7,11 +7,8 @@
         def debate(self, view) -> dict: ...
         def vote(self, view) -> str:  # "aye" | "nay"
 
-The harness owns transport, reconnects, deadlines, and clean exit. A callback
-that raises or overruns its window sends NO reply — the server applies the phase
-default and marks it ``default: true`` (never fabricate an action client-side).
-Pure source-owned baseline callbacks return values directly; native callbacks are
-asynchronous. The SDK and native whole-game tests enforce production parser parity.
+The harness owns transport, request IDs and deadlines. A failed callback sends
+an empty response for its request ID so the host can adjudicate the failure.
 """
 
 from __future__ import annotations
@@ -89,7 +86,9 @@ class GameView:
             self.request = msg
         if mtype == "lobby":
             self.seat = msg["seat"]
-            self.prompt_selection = PromptSelection.model_validate(msg.get("prompt_selection", {}))
+            self.prompt_selection = PromptSelection.model_validate(
+                msg.get("prompt_selection", {})
+            )
         elif mtype == "game_start":
             self.session = msg.get("session", {})
             self.host_constraints = msg.get("host_constraints", [])
@@ -143,9 +142,18 @@ class GameView:
 # --- policy -----------------------------------------------------------------
 
 
+PHASES = {
+    "introduce_request": ("introduce", "name"),
+    "action_request": ("action", "action"),
+    "action_repair_request": ("action", "action"),
+    "proposal_request": ("propose", "proposal"),
+    "debate_request": ("debate", None),
+    "vote_request": ("vote", "vote"),
+}
+
+
 class Policy:
-    """Override the five decision callbacks. Raising or overrunning a window is
-    safe (the server defaults) but fails the conformance gate."""
+    """Override the five decision callbacks."""
 
     def introduce(self, view: GameView) -> str | Coroutine[Any, Any, str]:
         raise NotImplementedError
@@ -162,12 +170,19 @@ class Policy:
     def vote(self, view: GameView) -> str | Coroutine[Any, Any, str]:
         raise NotImplementedError
 
+    async def reply(self, view: GameView) -> dict:
+        phase, field = PHASES[view.request["type"]]
+        answer = getattr(self, phase)(view)
+        if inspect.isawaitable(answer):
+            answer = await answer
+        return {field: answer} if field else answer
+
     def on_message(self, view: GameView, raw: dict) -> None:
         """Optional observer for every inbound message."""
 
 
 @dataclass
-class DefaultEvent:
+class PlayerFailure:
     turn: int
     phase: str
     reason: str
@@ -232,15 +247,14 @@ class PlayerSession:
         self.policy = policy
         self.transport = transport
         self.view = GameView()
-        self.defaults: list[DefaultEvent] = []
+        self.failures: list[PlayerFailure] = []
         self.final: dict | None = None
         self.stopped = False
         self.cleanup_deadline = float("inf")
 
-    async def _callback(self, phase: str, timeout_s: float) -> Any:
+    async def _callback(self, timeout_s: float) -> dict:
         """Await native policy work under its owned absolute decision deadline."""
         budget = max(0.1, timeout_s - REPLY_MARGIN_S)
-        fn = getattr(self.policy, phase)
         view = copy.deepcopy(self.view)
         publish = AttemptPublisher(view.request["rid"], self.transport.send)
         window = LearnerWindow(
@@ -248,22 +262,11 @@ class PlayerSession:
         )
         token = current_window.set(window)
         try:
-            if inspect.iscoroutinefunction(fn):
-                return await bounded(
-                    fn(view), asyncio.get_running_loop().time() + budget
-                )
-            return fn(view)
-        except TimeoutError:
-            self.defaults.append(DefaultEvent(view.turn, phase, "timeout"))
-        except Exception as e:  # noqa: BLE001 - existing callback boundary applies engine defaults
-            if isinstance(e, OwnershipUnsettled):
-                raise
-            self.defaults.append(
-                DefaultEvent(view.turn, phase, f"exception: {type(e).__name__}")
+            return await bounded(
+                self.policy.reply(view), asyncio.get_running_loop().time() + budget
             )
         finally:
             current_window.reset(token)
-        return None
 
     async def handle(self, msg: dict) -> None:
         self.view.fold(msg)
@@ -272,69 +275,25 @@ class PlayerSession:
         except Exception:  # noqa: BLE001 - observer hooks never crash the loop
             pass
         mtype = msg.get("type")
-        if mtype == "introduce_request":
-            name = await self._callback("introduce", msg.get("timeout_s", 15))
-            if isinstance(name, str) and name.strip():
-                await self.transport.send(make_reply(msg["rid"], {"name": name}))
-            elif name is not None:
-                self.defaults.append(
-                    DefaultEvent(self.view.turn, "introduce", "empty return")
-                )
-        elif mtype in {"action_request", "action_repair_request"}:
-            action = await self._callback("action", msg.get("timeout_s", 10))
-            if isinstance(action, str) and action.strip():
-                await self.transport.send(make_reply(msg["rid"], {"action": action}))
-            elif action is not None:
-                self.defaults.append(
-                    DefaultEvent(self.view.turn, "action", "empty return")
-                )
-        elif mtype == "proposal_request":
-            proposal = await self._callback("propose", msg.get("timeout_s", 10))
-            if isinstance(proposal, dict):
-                await self.transport.send(
-                    make_reply(msg["rid"], {"proposal": proposal})
-                )
-            elif isinstance(proposal, str) and proposal.strip():
-                await self.transport.send(
-                    make_reply(
-                        msg["rid"],
-                        {
-                            "proposal": {
-                                "kind": "enact",
-                                "text": proposal.strip(),
-                                "rationale": "SDK shorthand proposal",
-                            }
-                        },
-                    )
-                )
-            elif proposal is not None:
-                self.defaults.append(
-                    DefaultEvent(self.view.turn, "propose", "empty return")
-                )
-        elif mtype == "debate_request":
-            debate = await self._callback("debate", msg.get("timeout_s", 10))
-            if isinstance(debate, dict) and isinstance(debate.get("text"), str):
-                await self.transport.send(make_reply(msg["rid"], debate))
-            elif isinstance(debate, str) and debate.strip():
-                await self.transport.send(
-                    make_reply(
-                        msg["rid"], {"text": debate.strip(), "vote_intent": "nay"}
-                    )
-                )
-            elif debate is not None:
-                self.defaults.append(
-                    DefaultEvent(self.view.turn, "debate", "empty return")
-                )
-        elif mtype == "vote_request":
-            vote = await self._callback("vote", msg.get("timeout_s", 6))
-            if vote in ("aye", "nay"):
-                await self.transport.send(make_reply(msg["rid"], {"vote": vote}))
-            elif vote is not None:
-                self.defaults.append(
-                    DefaultEvent(self.view.turn, "vote", "invalid vote return")
-                )
-        elif mtype == "final":
+        if mtype == "final":
             self.final = msg
+            return
+        if mtype not in PHASES:
+            return
+        try:
+            reply = await self._callback(msg["timeout_s"])
+            if not isinstance(reply, dict) or "rid" in reply:
+                raise ValueError(
+                    "return one action object without a transport request ID"
+                )
+        except OwnershipUnsettled:
+            raise
+        except Exception as error:
+            self.failures.append(
+                PlayerFailure(self.view.turn, mtype, type(error).__name__)
+            )
+            reply = {}
+        await self.transport.send(make_reply(msg["rid"], reply))
 
     async def run(self) -> None:
         """Consume messages until `final`. Treat any close after `final` as clean."""
@@ -373,9 +332,9 @@ async def run_ws_player(
             await asyncio.sleep(min(5.0, 0.5 * attempt))
         finally:
             await bounded(transport.close(), asyncio.get_running_loop().time() + 1)
-    for event in session.defaults:
+    for event in session.failures:
         print(
-            f"[sdk] defaulted turn={event.turn} phase={event.phase}: {event.reason}",
+            f"[sdk] failed turn={event.turn} phase={event.phase}: {event.reason}",
             file=sys.stderr,
             flush=True,
         )

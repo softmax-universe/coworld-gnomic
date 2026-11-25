@@ -8,7 +8,7 @@ from gnomic.players.baseline import BaselinePolicy
 from gnomic.judge import ActionRuling, DeterministicJudge
 from gnomic.server.channel import InProcessChannel
 from gnomic.server.config import GameConfig
-from gnomic.server.episode import Episode
+from gnomic.server.episode import Episode, PlayerMoveError
 
 
 def config(**overrides) -> GameConfig:
@@ -214,3 +214,214 @@ async def test_player_facing_game_start_never_reveals_seat_ownership() -> None:
         assert [row["policy"] for row in seats] == ["Ivan", "Anton", "Yura"]
         assert all("player" not in row for row in seats)
         assert "Alpha" not in str(seats)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase,bad_reply",
+    [
+        ("action", {"text": "pass"}),
+        ("action", {"action": {"text": "pass"}}),
+        ("action", {"action": "   "}),
+        ("proposal", {"kind": "enact", "text": "Unwrapped alias."}),
+        ("proposal", {"proposal": {"kind": "amend", "rule_id": True, "text": "Bool id."}}),
+        ("proposal", {"proposal": {"kind": "enact", "text": "Extra.", "extra": 1}}),
+        ("debate", {"text": "Bad intent.", "vote_intent": "maybe"}),
+        ("debate", {"text": "   ", "vote_intent": "aye"}),
+        ("vote", {"vote": "abstain"}),
+        ("vote", {"vote": "aye", "extra": 1}),
+    ],
+)
+async def test_invalid_or_alias_move_fails_explicitly_without_default(
+    phase: str, bad_reply: dict
+) -> None:
+    channels = [InProcessChannel(i) for i in range(3)]
+    target_request = f"{phase}_request"
+    failing_seat = 1 if phase == "debate" else 0
+
+    async def driver(channel: InProcessChannel) -> None:
+        policy = BaselinePolicy()
+        while True:
+            message = await channel.player_recv()
+            if message.get("type") == "final":
+                return
+            if message.get("type") == target_request and channel.seat == failing_seat:
+                await channel.player_send({"rid": message["rid"], **bad_reply})
+                continue
+            reply = await policy.respond(message)
+            if reply is not None:
+                await channel.player_send(reply)
+
+    tasks = [asyncio.create_task(driver(channel)) for channel in channels]
+    emitted: list[dict] = []
+
+    async def broadcast(message: dict) -> None:
+        emitted.append(message)
+
+    episode = Episode(config(turns_max=3), channels, seed=11, broadcast=broadcast)
+    with pytest.raises(PlayerMoveError) as exc_info:
+        await episode.run()
+    for channel in channels:
+        await channel.send({"type": "final", "scores": None})
+    await asyncio.gather(*tasks)
+
+    err = exc_info.value
+    assert episode.results is None
+    assert err.phase == phase
+    assert err.turn == 1
+    assert err.failed_seats == [failing_seat]
+    assert err.failures[0]["reason"] == "invalid_reply"
+    assert episode.move_failure == {
+        "turn": 1,
+        "phase": phase,
+        "failed_seats": [failing_seat],
+        "failures": err.failures,
+    }
+    assert episode.operator_log()["move_failure"] == episode.move_failure
+    forbidden_event = {
+        "action": "action_made",
+        "proposal": "proposal_made",
+        "debate": "debate_made",
+        "vote": "vote_reveal",
+    }[phase]
+    assert not any(event["type"] == forbidden_event for event in emitted)
+    assert not any(event["type"] == "game_over" for event in emitted)
+
+
+@pytest.mark.asyncio
+async def test_action_repair_timeout_fails_after_preserving_attempt_one() -> None:
+    channels = [InProcessChannel(i) for i in range(3)]
+
+    async def driver(channel: InProcessChannel) -> None:
+        policy = BaselinePolicy()
+        while True:
+            message = await channel.player_recv()
+            if message.get("type") == "final":
+                return
+            if message.get("type") == "action_request":
+                await channel.player_send(
+                    {"rid": message["rid"], "action": "I take 50 points."}
+                )
+                continue
+            if message.get("type") == "action_repair_request":
+                continue
+            reply = await policy.respond(message)
+            if reply is not None:
+                await channel.player_send(reply)
+
+    class RejectJudge(DeterministicJudge):
+        async def act(self, board, action_record, turn, turns_max):  # type: ignore[override]
+            return (
+                ActionRuling(
+                    valid=False,
+                    summary="Unauthorized action.",
+                    state_ops=[],
+                    winner_slots=[],
+                ),
+                {"calls": 0, "input_tokens": 0, "output_tokens": 0, "latency_ms": 0},
+            )
+
+    tasks = [asyncio.create_task(driver(channel)) for channel in channels]
+    emitted: list[dict] = []
+
+    async def broadcast(message: dict) -> None:
+        emitted.append(message)
+
+    episode = Episode(
+        config(turns_max=1, action_window_s=0.05), channels, seed=5, broadcast=broadcast
+    )
+    episode.judge = RejectJudge()
+    with pytest.raises(PlayerMoveError) as exc_info:
+        await episode.run()
+    for channel in channels:
+        await channel.send({"type": "final", "scores": None})
+    await asyncio.gather(*tasks)
+
+    assert episode.results is None
+    assert exc_info.value.phase == "action_repair"
+    assert exc_info.value.failed_seats == [0]
+    assert exc_info.value.failures[0]["reason"] == "timeout"
+    actions = [event for event in emitted if event["type"] == "action_made"]
+    assert [event["attempt"] for event in actions] == [1]
+    assert not any(event["type"] == "proposal_made" for event in emitted)
+    assert not any(event["type"] == "game_over" for event in emitted)
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_debate_and_vote_failures_record_all_failing_seats_without_scores() -> None:
+    channels = [InProcessChannel(i) for i in range(3)]
+
+    async def bad_debaters(channel: InProcessChannel) -> None:
+        policy = BaselinePolicy()
+        while True:
+            message = await channel.player_recv()
+            if message.get("type") == "final":
+                return
+            if message.get("type") == "debate_request":
+                continue
+            reply = await policy.respond(message)
+            if reply is not None:
+                await channel.player_send(reply)
+
+    tasks = [asyncio.create_task(bad_debaters(channel)) for channel in channels]
+    episode = Episode(config(turns_max=1, debate_window_s=0.05), channels, seed=13)
+    with pytest.raises(PlayerMoveError) as exc_info:
+        await episode.run()
+    for channel in channels:
+        await channel.send({"type": "final", "scores": None})
+    await asyncio.gather(*tasks)
+
+    assert episode.results is None
+    assert exc_info.value.phase == "debate"
+    assert exc_info.value.failed_seats == [1, 2]
+    assert [f["reason"] for f in exc_info.value.failures] == ["timeout", "timeout"]
+
+    channels = [InProcessChannel(i) for i in range(3)]
+
+    async def bad_voters(channel: InProcessChannel) -> None:
+        policy = BaselinePolicy()
+        while True:
+            message = await channel.player_recv()
+            if message.get("type") == "final":
+                return
+            if message.get("type") == "vote_request":
+                await channel.player_send({"rid": message["rid"], "vote": "invalid"})
+                continue
+            reply = await policy.respond(message)
+            if reply is not None:
+                await channel.player_send(reply)
+
+    tasks = [asyncio.create_task(bad_voters(channel)) for channel in channels]
+    episode = Episode(config(turns_max=1, vote_window_s=0.05), channels, seed=14)
+    with pytest.raises(PlayerMoveError) as exc_info:
+        await episode.run()
+    for channel in channels:
+        await channel.send({"type": "final", "scores": None})
+    await asyncio.gather(*tasks)
+
+    assert episode.results is None
+    assert exc_info.value.phase == "vote"
+    assert exc_info.value.failed_seats == [0, 1, 2]
+    assert [f["reason"] for f in exc_info.value.failures] == [
+        "invalid_reply",
+        "invalid_reply",
+        "invalid_reply",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_disconnected_seat_fails_without_inventing_scores() -> None:
+    from gnomic.server.channel import NullSeatChannel
+
+    channels = [NullSeatChannel(0), InProcessChannel(1), NullSeatChannel(2)]
+    task = asyncio.create_task(drive(channels[1]))  # type: ignore[arg-type]
+    episode = Episode(config(turns_max=1), channels, seed=15)
+    with pytest.raises(PlayerMoveError) as exc_info:
+        await episode.run()
+    await channels[1].send({"type": "final", "scores": None})
+    await task
+
+    assert episode.results is None
+    assert exc_info.value.phase == "action"
+    assert exc_info.value.failed_seats == [0]
+    assert exc_info.value.failures[0]["reason"] == "disconnected"

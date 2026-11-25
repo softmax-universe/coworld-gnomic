@@ -480,16 +480,3 @@ class Board:
         points = self.state.game_points()
         best = max(points)
         return [seat for seat, score in enumerate(points) if score == best]
-
-
-def default_proposal(turn: int) -> dict[str, Any]:
-    return {
-        "kind": "enact",
-        "text": f"Rule proposed on turn {turn}: no game effect.",
-        "rationale": "Defaulted because the proposer did not return a valid proposal.",
-        "default": True,
-    }
-
-
-def default_action() -> dict[str, Any]:
-    return {"text": "pass", "default": True}

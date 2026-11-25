@@ -97,7 +97,8 @@ def main() -> None:
                     )
                     assert "prompt_selection" not in decision.prompt[1]["content"]
                     assert "prompt_template" not in decision.prompt[1]["content"]
-                    systems.setdefault(wording, set()).add(
+                    phase = decision.observation["view"]["request"]["type"]
+                    systems.setdefault(phase, {}).setdefault(wording, set()).add(
                         decision.prompt[0]["content"]
                     )
                     trace.append(
@@ -129,8 +130,9 @@ def main() -> None:
                     "decisions PASS",
                     flush=True,
                 )
-    assert all(len(values) == 1 for values in systems.values())
-    assert len({next(iter(values)) for values in systems.values()}) == 7
+    for by_wording in systems.values():
+        assert all(len(values) == 1 for values in by_wording.values())
+        assert len({next(iter(values)) for values in by_wording.values()}) == 7
     if roots[7] != roots[19]:
         assert families[7] != families[19]
     print(

@@ -43,12 +43,11 @@ The game image includes a live spectator and replay renderer. The bundled
 separately uploaded Opus policies playing Ivan, Anton, and Yura. Player calls
 use adaptive high-effort reasoning, a 20,000-token advisory task budget, and a
 32,768-token hard ceiling. Non-proposers reconsider their vote after seeing
-both debate statements, and contradictory/immediate-loss decisions are rejected
-and repaired. Their shared scaffold treats each gnome as both competitor and
+both debate statements, and players may choose either legal vote. Their shared scaffold treats each gnome as both competitor and
 co-designer, favoring reusable mechanics and meaningful choices over seat gifts
 and threshold churn.
 Production decision windows are 600 seconds so a high-effort call may finish
-without the host replacing it with a deterministic default.
+within its assigned decision window.
 The manifest also sets the hosted episode deadline to 100 minutes; the platform
 otherwise applies a 20-minute Kubernetes deadline, which is too short for a
 45-turn high-reasoning game.

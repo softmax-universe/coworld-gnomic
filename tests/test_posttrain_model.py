@@ -18,10 +18,10 @@ from gnomic.server.episode import Episode
 def scripted_generation(messages: list[dict[str, str]], _deadline: float) -> str:
     context = json.loads(messages[1]["content"])
     request = context["request"]
-    assert request["rid"] > 0
+    assert "rid" not in request
     if request["type"] != "introduce_request":
         assert context["host_constraints"]
-    reply = {"rid": request["rid"]}
+    reply = {}
     if request["type"] == "introduce_request":
         reply["name"] = "Model Gnome"
     elif request["type"] in {"action_request", "action_repair_request"}:
@@ -36,7 +36,7 @@ def scripted_generation(messages: list[dict[str, str]], _deadline: float) -> str
         reply.update({"text": "I support this common rule.", "vote_intent": "aye"})
     elif request["type"] == "vote_request":
         reply["vote"] = "aye"
-    return json.dumps(reply)
+    return "```json\n" + json.dumps(reply) + "\n```"
 
 
 @pytest.mark.asyncio
@@ -76,7 +76,7 @@ async def test_model_policy_completes_normal_three_seat_game(monkeypatch) -> Non
         await channel.send({"type": "final", "scores": results["scores"]})
     await asyncio.gather(*tasks)
     assert results["turns_played"] == 3
-    assert all(not session.defaults for session in sessions)
+    assert all(not session.failures for session in sessions)
     assert all(
         event["action"] == {"text": "pass", "default": False}
         for event in replay["events"]
@@ -85,11 +85,16 @@ async def test_model_policy_completes_normal_three_seat_game(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
-async def test_model_policy_rejects_wrong_request_id(monkeypatch) -> None:
+async def test_model_policy_rejects_two_actions(monkeypatch) -> None:
     async def wrong_reply(body, model, **kwargs):
         return Response(
             model=model,
-            content=[{"type": "text", "text": '{"rid":99,"action":"pass"}'}],
+            content=[
+                {
+                    "type": "text",
+                    "text": '{"action":"pass"} {"action":"different move"}',
+                }
+            ],
             usage={"input_tokens": 1, "output_tokens": 1},
         )
 
@@ -103,6 +108,6 @@ async def test_model_policy_rejects_wrong_request_id(monkeypatch) -> None:
     await session.handle(
         {"type": "action_request", "turn": 1, "rid": 1, "timeout_s": 2}
     )
-    assert len(session.defaults) == 1
-    assert "ValueError" in session.defaults[0].reason
-    assert channel._queue.empty()
+    assert len(session.failures) == 1
+    assert "ValueError" in session.failures[0].reason
+    assert await channel.recv_reply(1, 1) == {"rid": 1}

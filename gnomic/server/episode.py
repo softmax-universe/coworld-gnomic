@@ -16,8 +16,6 @@ from ..engine import (
     HOST_CONSTRAINTS,
     SEAT_COUNT,
     Board,
-    default_action,
-    default_proposal,
 )
 from ..judge import (
     ACTION_JUDGE_SYSTEM,
@@ -38,6 +36,22 @@ from .config import GameConfig
 GNOME_SEAT_NAMES = ["Ivan", "Anton", "Yura"]
 
 Broadcast = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+class PlayerMoveError(RuntimeError):
+    """A seat failed to provide a valid protocol move during a decision phase."""
+
+    def __init__(
+        self, turn: int, phase: str, failures: list[dict[str, Any]]
+    ) -> None:
+        self.turn = turn
+        self.phase = phase
+        self.failures = sorted(failures, key=lambda item: item["seat"])
+        self.failed_seats = [item["seat"] for item in self.failures]
+        summary = ", ".join(
+            f"seat {item['seat']} ({item['reason']})" for item in self.failures
+        )
+        super().__init__(f"Move failure in {phase} on turn {turn}: {summary}")
 
 
 def _draw_host_random(rng: random.Random) -> dict[str, Any]:
@@ -99,6 +113,7 @@ class Episode:
         self.current_phase = "lobby"
         self.winner_slots: list[int] = []
         self.termination = ""
+        self.move_failure: dict[str, Any] | None = None
         self.judge_usage = {
             "calls": 0,
             "input_tokens": 0,
@@ -126,26 +141,122 @@ class Episode:
         await channel.send(message)
 
     @staticmethod
-    def canonical_action(request: dict, seat: int, raw: dict | None) -> dict:
+    def _strip_wire_rid(raw: Any) -> dict[str, Any] | None:
+        if not isinstance(raw, dict):
+            return None
+        return {k: v for k, v in raw.items() if k != "rid"}
+
+    def _failure_entry(
+        self,
+        channel: SeatChannel,
+        rid: int,
+        raw: dict[str, Any] | None,
+        detail: str,
+    ) -> dict[str, Any]:
+        payload = self._strip_wire_rid(raw)
+        if not payload:
+            if raw is None and not channel.connected:
+                return {
+                    "seat": channel.seat,
+                    "rid": rid,
+                    "reason": "disconnected",
+                    "detail": "Seat was absent or disconnected.",
+                }
+            window = self.capture.windows.get((channel.seat, rid))
+            attempts = list(window.attempts.values()) if window is not None else []
+            if attempts:
+                last = attempts[-1]
+                if (
+                    last.http_status == 200
+                    and last.response_complete is True
+                    and last.response is not None
+                ):
+                    return {
+                        "seat": channel.seat,
+                        "rid": rid,
+                        "reason": "invalid_model_reply",
+                        "detail": "Model returned a response that failed player validation.",
+                    }
+                if (
+                    last.rejection_reason == "TimeoutError"
+                    or last.response_complete is False
+                ):
+                    return {
+                        "seat": channel.seat,
+                        "rid": rid,
+                        "reason": "provider_timeout",
+                        "detail": "Model provider timed out before completing a response.",
+                    }
+                if last.http_status is not None and last.http_status != 200:
+                    return {
+                        "seat": channel.seat,
+                        "rid": rid,
+                        "reason": "provider_error",
+                        "detail": f"Model provider returned HTTP {last.http_status}.",
+                    }
+                return {
+                    "seat": channel.seat,
+                    "rid": rid,
+                    "reason": "provider_error",
+                    "detail": f"Model generation failed ({last.rejection_reason or 'unknown error'}).",
+                }
+            if raw is None:
+                return {
+                    "seat": channel.seat,
+                    "rid": rid,
+                    "reason": "timeout",
+                    "detail": "Seat did not reply before the decision window expired.",
+                }
+        return {
+            "seat": channel.seat,
+            "rid": rid,
+            "reason": "invalid_reply",
+            "detail": detail,
+        }
+
+    def _raise_move_failure(
+        self, turn: int, phase: str, failures: list[dict[str, Any]]
+    ) -> None:
+        ordered = sorted(failures, key=lambda item: item["seat"])
+        self.move_failure = {
+            "turn": turn,
+            "phase": phase,
+            "failed_seats": [item["seat"] for item in ordered],
+            "failures": ordered,
+        }
+        raise PlayerMoveError(turn, phase, ordered)
+
+    @staticmethod
+    def canonical_action(request: dict, seat: int, raw: dict | None) -> dict | None:
         kind = request["type"]
         if kind == "introduce_request":
-            return (
-                {"name": raw["name"].strip()[:40]}
-                if isinstance(raw, dict) and isinstance(raw.get("name"), str)
-                else {}
-            )
+            if not isinstance(raw, dict) or set(raw.keys()) != {"name"}:
+                return None
+            name = raw.get("name")
+            if not isinstance(name, str):
+                return None
+            clean = "".join(ch for ch in name.strip() if ch.isprintable())[:40].strip()
+            return {"name": clean} if clean else None
         if kind in {"action_request", "action_repair_request"}:
-            action = Episode._parse_action(raw)
-            return {"action": action["text"]}
+            action, _ = Episode._parse_action(raw)
+            return {"action": action["text"]} if action is not None else None
         if kind == "proposal_request":
-            action = Episode._parse_proposal(raw, request["turn"])
-            return {"proposal": {k: v for k, v in action.items() if k != "default"}}
+            proposal, _ = Episode._parse_proposal(raw)
+            return (
+                {"proposal": {k: v for k, v in proposal.items() if k != "default"}}
+                if proposal is not None
+                else None
+            )
         if kind == "debate_request":
-            action = Episode._parse_debate(seat, raw)
-            return {k: v for k, v in action.items() if k not in {"seat", "default"}}
+            debate, _ = Episode._parse_debate(seat, raw)
+            return (
+                {k: v for k, v in debate.items() if k not in {"seat", "default"}}
+                if debate is not None
+                else None
+            )
         if kind == "vote_request":
-            action = Episode._parse_vote(seat, raw)
-            return {"vote": action["vote"]}
+            vote, _ = Episode._parse_vote(seat, raw)
+            return {"vote": vote["vote"]} if vote is not None else None
         raise ValueError("Unknown decision request")
 
     def _next_rid(self) -> int:
@@ -256,98 +367,117 @@ class Episode:
         )
 
     @staticmethod
-    def _parse_action(raw: dict[str, Any] | None) -> dict[str, Any]:
+    def _parse_action(
+        raw: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
         if not isinstance(raw, dict):
-            return default_action()
-        value = raw.get("action", raw.get("text"))
-        if isinstance(value, dict):
-            value = value.get("text")
-        if not isinstance(value, str) or not value.strip():
-            return default_action()
-        return {"text": value.strip()[:2_000], "default": False}
+            return None, "action reply must be a JSON object"
+        if set(raw.keys()) != {"action"}:
+            return None, "action reply must contain only the 'action' field"
+        value = raw.get("action")
+        if not isinstance(value, str):
+            return None, "action must be a string"
+        text = value.strip()
+        if not text or len(text) > 2_000:
+            return None, "action must be a non-empty string of at most 2000 characters"
+        return {"text": text, "default": False}, None
 
     @staticmethod
-    def _parse_proposal(raw: dict[str, Any] | None, turn: int) -> dict[str, Any]:
+    def _parse_proposal(
+        raw: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
         if not isinstance(raw, dict):
-            return default_proposal(turn)
-        payload = raw.get("proposal", raw)
+            return None, "proposal reply must be a JSON object"
+        if set(raw.keys()) != {"proposal"}:
+            return None, "proposal reply must contain only the 'proposal' field"
+        payload = raw.get("proposal")
         if not isinstance(payload, dict):
-            return default_proposal(turn)
+            return None, "proposal must be a JSON object"
         kind = payload.get("kind")
+        if kind not in ("enact", "amend", "repeal", "transmute"):
+            return None, "proposal kind must be enact, amend, repeal, or transmute"
+        allowed_keys = {
+            "enact": {"kind", "text", "rationale"},
+            "amend": {"kind", "rule_id", "text", "rationale"},
+            "repeal": {"kind", "rule_id", "rationale"},
+            "transmute": {"kind", "rule_id", "rationale"},
+        }[kind]
+        if not set(payload.keys()) <= allowed_keys:
+            return None, f"{kind} proposal contains unexpected fields"
+        rationale = payload.get("rationale", "")
+        if not isinstance(rationale, str) or len(rationale) > 2_000:
+            return None, "proposal rationale must be a string of at most 2000 characters"
         text = payload.get("text")
         rule_id = payload.get("rule_id")
-        rationale = payload.get("rationale", "")
-        if kind == "enact" and isinstance(text, str) and 0 < len(text.strip()) <= 2_000:
+        if kind == "enact":
+            if not isinstance(text, str) or not 0 < len(text.strip()) <= 2_000:
+                return None, "enact proposal requires non-empty text of at most 2000 characters"
             return {
                 "kind": kind,
                 "text": text.strip(),
-                "rationale": str(rationale)[:2_000],
+                "rationale": rationale,
                 "default": False,
-            }
-        if (
-            kind == "amend"
-            and isinstance(rule_id, int)
-            and isinstance(text, str)
-            and 0 < len(text.strip()) <= 2_000
-        ):
+            }, None
+        if isinstance(rule_id, bool) or not isinstance(rule_id, int):
+            return None, f"{kind} proposal requires an integer rule_id"
+        if kind == "amend":
+            if not isinstance(text, str) or not 0 < len(text.strip()) <= 2_000:
+                return None, "amend proposal requires non-empty text of at most 2000 characters"
             return {
                 "kind": kind,
                 "rule_id": rule_id,
                 "text": text.strip(),
-                "rationale": str(rationale)[:2_000],
+                "rationale": rationale,
                 "default": False,
-            }
-        if kind == "repeal" and isinstance(rule_id, int):
-            return {
-                "kind": kind,
-                "rule_id": rule_id,
-                "rationale": str(rationale)[:2_000],
-                "default": False,
-            }
-        if kind == "transmute" and isinstance(rule_id, int):
-            return {
-                "kind": kind,
-                "rule_id": rule_id,
-                "rationale": str(rationale)[:2_000],
-                "default": False,
-            }
-        return default_proposal(turn)
+            }, None
+        return {
+            "kind": kind,
+            "rule_id": rule_id,
+            "rationale": rationale,
+            "default": False,
+        }, None
 
     @staticmethod
-    def _parse_debate(seat: int, raw: dict[str, Any] | None) -> dict[str, Any]:
-        if not isinstance(raw, dict) or not isinstance(raw.get("text"), str):
-            return {
-                "seat": seat,
-                "text": "No statement.",
-                "vote_intent": "nay",
-                "default": True,
-            }
+    def _parse_debate(
+        seat: int, raw: dict[str, Any] | None
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if not isinstance(raw, dict):
+            return None, "debate reply must be a JSON object"
+        if set(raw.keys()) != {"text", "vote_intent"}:
+            return None, "debate reply must contain only 'text' and 'vote_intent'"
+        text = raw.get("text")
+        if not isinstance(text, str) or not 0 < len(text.strip()) <= 2_000:
+            return None, "debate text must be a non-empty string of at most 2000 characters"
         intent = raw.get("vote_intent")
-        if intent not in {"aye", "nay"}:
-            intent = "nay"
+        if intent not in ("aye", "nay"):
+            return None, "debate vote_intent must be 'aye' or 'nay'"
         return {
             "seat": seat,
-            "text": raw["text"][:2_000],
+            "text": text,
             "vote_intent": intent,
             "default": False,
-        }
+        }, None
 
     @staticmethod
-    def _parse_vote(seat: int, raw: dict[str, Any] | None) -> dict[str, Any]:
-        vote = raw.get("vote") if isinstance(raw, dict) else None
-        if vote not in {"aye", "nay"}:
-            return {
-                "seat": seat,
-                "vote": "nay",
-                "reason": "Invalid or missing vote.",
-                "default": True,
-            }
+    def _parse_vote(
+        seat: int, raw: dict[str, Any] | None
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if not isinstance(raw, dict):
+            return None, "vote reply must be a JSON object"
+        if not set(raw.keys()) <= {"vote", "reason"} or "vote" not in raw:
+            return None, "vote reply must contain 'vote' and optional 'reason' only"
+        vote = raw.get("vote")
+        if vote not in ("aye", "nay"):
+            return None, "vote must be 'aye' or 'nay'"
+        reason = raw.get("reason", "")
+        if not isinstance(reason, str) or len(reason) > 1_000:
+            return None, "vote reason must be a string of at most 1000 characters"
         return {
             "seat": seat,
             "vote": vote,
-            "reason": str(raw.get("reason", ""))[:1_000],
+            "reason": reason,
             "default": False,
-        }
+        }, None
 
     async def _proposal(self, turn: int, proposer: int) -> dict[str, Any]:
         self.current_phase = "proposal"
@@ -358,17 +488,23 @@ class Episode:
             "rid": rid,
             "timeout_s": self.config.proposal_window_s,
         }
-        await self._send(self.channels[proposer], request)
-        raw = await self.channels[proposer].recv_reply(
-            rid, self.config.proposal_window_s
-        )
-        proposal = self._parse_proposal(raw, turn)
+        channel = self.channels[proposer]
+        await self._send(channel, request)
+        raw = await channel.recv_reply(rid, self.config.proposal_window_s)
+        proposal, detail = self._parse_proposal(self._strip_wire_rid(raw))
+        if proposal is None:
+            self.capture.consumed(proposer, rid, raw, None, False)
+            self._raise_move_failure(
+                turn,
+                "proposal",
+                [self._failure_entry(channel, rid, raw, detail or "invalid proposal")],
+            )
         self.capture.consumed(
             proposer,
             rid,
             raw,
             {"proposal": {k: v for k, v in proposal.items() if k != "default"}},
-            proposal["default"],
+            False,
         )
         return proposal
 
@@ -385,7 +521,8 @@ class Episode:
         prior_action: dict[str, Any] | None = None,
         rejection_reason: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        self.current_phase = "action" if attempt == 1 else "action_repair"
+        phase = "action" if attempt == 1 else "action_repair"
+        self.current_phase = phase
         rid = self._next_rid()
         request: dict[str, Any] = {
             "type": "action_request" if attempt == 1 else "action_repair_request",
@@ -395,14 +532,21 @@ class Episode:
             "attempt": attempt,
         }
         if attempt == 2:
-            request["original_action"] = prior_action or default_action()
+            assert prior_action is not None
+            request["original_action"] = prior_action
             request["rejection_reason"] = rejection_reason or "The action was rejected."
-        await self._send(self.channels[proposer], request)
-        raw = await self.channels[proposer].recv_reply(rid, self.config.action_window_s)
-        action = self._parse_action(raw)
-        self.capture.consumed(
-            proposer, rid, raw, {"action": action["text"]}, action["default"]
-        )
+        channel = self.channels[proposer]
+        await self._send(channel, request)
+        raw = await channel.recv_reply(rid, self.config.action_window_s)
+        action, detail = self._parse_action(self._strip_wire_rid(raw))
+        if action is None:
+            self.capture.consumed(proposer, rid, raw, None, False)
+            self._raise_move_failure(
+                turn,
+                phase,
+                [self._failure_entry(channel, rid, raw, detail or "invalid action")],
+            )
+        self.capture.consumed(proposer, rid, raw, {"action": action["text"]}, False)
         made = {
             "type": "action_made",
             "turn": turn,
@@ -470,7 +614,9 @@ class Episode:
     ) -> list[dict[str, Any]]:
         self.current_phase = "debate"
 
-        async def one(seat: int) -> dict[str, Any]:
+        async def one(
+            seat: int,
+        ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
             rid = self._next_rid()
             request = {
                 "type": "debate_request",
@@ -483,31 +629,41 @@ class Episode:
                     turn=turn, proposal_kind=str(proposal.get("kind", ""))
                 ),
             }
-            await self._send(self.channels[seat], request)
-            raw = await self.channels[seat].recv_reply(rid, self.config.debate_window_s)
-            action = self._parse_debate(seat, raw)
+            channel = self.channels[seat]
+            await self._send(channel, request)
+            raw = await channel.recv_reply(rid, self.config.debate_window_s)
+            action, detail = self._parse_debate(seat, self._strip_wire_rid(raw))
+            if action is None:
+                self.capture.consumed(seat, rid, raw, None, False)
+                return None, self._failure_entry(
+                    channel, rid, raw, detail or "invalid debate"
+                )
             self.capture.consumed(
                 seat,
                 rid,
                 raw,
                 {k: v for k, v in action.items() if k not in {"seat", "default"}},
-                action["default"],
+                False,
             )
-            return action
+            return action, None
 
         # Both debaters receive the same state and cannot condition on each other.
-        return list(
-            await asyncio.gather(
-                *(one(seat) for seat in range(SEAT_COUNT) if seat != proposer)
-            )
+        outcomes = await asyncio.gather(
+            *(one(seat) for seat in range(SEAT_COUNT) if seat != proposer)
         )
+        failures = [failure for _, failure in outcomes if failure is not None]
+        if failures:
+            self._raise_move_failure(turn, "debate", failures)
+        return [statement for statement, _ in outcomes if statement is not None]
 
     async def _vote(
         self, turn: int, proposal: dict[str, Any], debates: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         self.current_phase = "vote"
 
-        async def one(seat: int) -> dict[str, Any]:
+        async def one(
+            seat: int,
+        ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
             rid = self._next_rid()
             request = {
                 "type": "vote_request",
@@ -520,15 +676,23 @@ class Episode:
                     turn=turn, proposal_kind=str(proposal.get("kind", ""))
                 ),
             }
-            await self._send(self.channels[seat], request)
-            raw = await self.channels[seat].recv_reply(rid, self.config.vote_window_s)
-            action = self._parse_vote(seat, raw)
-            self.capture.consumed(
-                seat, rid, raw, {"vote": action["vote"]}, action["default"]
-            )
-            return action
+            channel = self.channels[seat]
+            await self._send(channel, request)
+            raw = await channel.recv_reply(rid, self.config.vote_window_s)
+            action, detail = self._parse_vote(seat, self._strip_wire_rid(raw))
+            if action is None:
+                self.capture.consumed(seat, rid, raw, None, False)
+                return None, self._failure_entry(
+                    channel, rid, raw, detail or "invalid vote"
+                )
+            self.capture.consumed(seat, rid, raw, {"vote": action["vote"]}, False)
+            return action, None
 
-        return list(await asyncio.gather(*(one(seat) for seat in range(SEAT_COUNT))))
+        outcomes = await asyncio.gather(*(one(seat) for seat in range(SEAT_COUNT)))
+        failures = [failure for _, failure in outcomes if failure is not None]
+        if failures:
+            self._raise_move_failure(turn, "vote", failures)
+        return [vote for vote, _ in outcomes if vote is not None]
 
     async def _run_turn(self, turn: int) -> None:
         self.current_turn = turn
@@ -700,9 +864,12 @@ class Episode:
         }
 
     def operator_log(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "seed": self.seed,
             "turn": self.current_turn,
             "phase": self.current_phase,
             "judge_usage": self.judge_usage,
         }
+        if self.move_failure is not None:
+            payload["move_failure"] = self.move_failure
+        return payload

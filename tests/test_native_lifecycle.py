@@ -301,7 +301,29 @@ async def instrument(self, *args, **kwargs):
     finally:
         await watcher
 LlmJudge._invoke = instrument
-from gnomic.server.app import main
+from gnomic.players.baseline import BaselinePolicy
+from gnomic.server.app import GameServer, main
+from gnomic.server.channel import InProcessChannel
+def _test_channels(self):
+    if not hasattr(self, '_cached_test_channels'):
+        channels = [InProcessChannel(i) for i in range(3)]
+        async def drive(ch):
+            policy = BaselinePolicy()
+            while True:
+                msg = await ch.player_recv()
+                if msg.get('type') == 'final':
+                    return
+                if msg.get('type') == 'introduce_request':
+                    await ch.player_send({'rid': msg['rid'], 'name': f'Seat-{ch.seat}'})
+                    continue
+                reply = await policy.respond(msg)
+                if reply is not None:
+                    await ch.player_send(reply)
+        for ch in channels:
+            asyncio.create_task(drive(ch))
+        self._cached_test_channels = channels
+    return self._cached_test_channels
+GameServer._episode_channels = _test_channels
 main()
 """
     async with partial_response(monkeypatch, b'{"partial":"\xc3') as observed:
