@@ -425,3 +425,41 @@ async def test_disconnected_seat_fails_without_inventing_scores() -> None:
     assert exc_info.value.phase == "action"
     assert exc_info.value.failed_seats == [0]
     assert exc_info.value.failures[0]["reason"] == "disconnected"
+
+
+def test_player_move_error_failure_payload_distinguishes_player_and_provider_causes() -> None:
+    player_err = PlayerMoveError(
+        1,
+        "debate",
+        [
+            {
+                "seat": 2,
+                "rid": 5,
+                "reason": "invalid_model_reply",
+                "detail": "Model returned a response that failed player validation.",
+            }
+        ],
+    )
+    payload = player_err.player_failure_payload()
+    assert set(payload) == {"failed_policy_index", "message", "kind"}
+    assert payload["failed_policy_index"] == 2
+    assert payload["kind"] == "player_error"
+    assert 1 <= len(payload["message"]) <= 2000
+
+    provider_err = PlayerMoveError(
+        1,
+        "vote",
+        [
+            {
+                "seat": 1,
+                "rid": 7,
+                "reason": "provider_error",
+                "detail": "Model provider returned HTTP 503.",
+            }
+        ],
+    )
+    inconclusive = provider_err.player_failure_payload()
+    assert set(inconclusive) == {"failed_policy_index", "message", "kind"}
+    assert inconclusive["failed_policy_index"] == 1
+    assert inconclusive["kind"] == "episode_inconclusive"
+    assert "HTTP 503" in inconclusive["message"]

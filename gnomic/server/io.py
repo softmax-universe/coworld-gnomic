@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Literal, cast
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 HTTP_USER_AGENT = "coworld-gnomic/0.1"
 
@@ -63,14 +64,15 @@ def write_data(uri: str, data: bytes | str, *, content_type: str, http_method: s
         request.add_header("User-Agent", HTTP_USER_AGENT)
         with urlopen(request, timeout=60):
             return
-    if parsed.scheme == "file":
-        path = Path(unquote(parsed.path))
+    if parsed.scheme in ("file", ""):
+        path = Path(unquote(parsed.path)) if parsed.scheme == "file" else Path(uri)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-        return
-    if parsed.scheme == "":
-        path = Path(uri)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+        try:
+            tmp.write_bytes(data)
+            os.replace(tmp, path)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
         return
     raise ValueError(f"Unsupported URI for write_data: {uri}")

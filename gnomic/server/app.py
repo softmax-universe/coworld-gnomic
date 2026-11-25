@@ -25,7 +25,7 @@ from gnomic.training import validate_capture_environment, write_private_episode
 
 from .channel import NullSeatChannel, SeatChannel, settle_channels
 from .config import GameConfig
-from .episode import Episode
+from .episode import Episode, PlayerMoveError
 from .io import artifact_method, maybe_decompress, read_data, write_data
 from .ws_channel import WebSocketSeatChannel
 
@@ -48,6 +48,7 @@ class GameServer:
         self.started = False
         self.done = False
         self.fatal_error: str | None = None
+        self.player_failure: dict[str, Any] | None = None
         self.episode: Episode | None = None
         self.results: dict[str, Any] | None = None
         self.replay: dict[str, Any] | None = None
@@ -257,6 +258,9 @@ class GameServer:
             await self._join_ownership()
             self.results = self.replay = None
             self.fatal_error = type(exc).__name__
+            if isinstance(exc, PlayerMoveError):
+                self.player_failure = exc.player_failure_payload()
+                self._write_player_failure()
             self._write_private(
                 "failed" if self.ownership_joined else "truncated", type(exc).__name__
             )
@@ -297,6 +301,17 @@ class GameServer:
                 http_method=artifact_method("COGAME_SAVE_REPLAY_METHOD"),
             )
         self._write_operator_log()
+
+    def _write_player_failure(self) -> None:
+        if self.player_failure is not None and os.environ.get(
+            "COGAME_PLAYER_FAILURE_URI"
+        ):
+            write_data(
+                os.environ["COGAME_PLAYER_FAILURE_URI"],
+                json.dumps(self.player_failure),
+                content_type="application/json",
+                http_method=artifact_method("COGAME_PLAYER_FAILURE_METHOD"),
+            )
 
     def _write_operator_log(self) -> None:
         if self.episode is not None and os.environ.get("COGAME_LOG_URI"):
@@ -461,7 +476,11 @@ def main() -> None:
     if game.started and not game.ownership_joined:
         raise SystemExit("game ownership did not settle")
     if game.fatal_error:
-        raise SystemExit(game.fatal_error)
+        raise SystemExit(
+            game.player_failure["message"]
+            if game.player_failure is not None
+            else game.fatal_error
+        )
 
 
 if __name__ == "__main__":
