@@ -285,7 +285,10 @@ async def test_native_episode_retains_exact_calls_and_freezes_elder(
     monkeypatch.setenv("COWORLD_LLM_TOP_P", "0.9")
     monkeypatch.setenv("COWORLD_EPISODE_ID", f"gnomic-native-{mode}-{seed}-{turns}")
     monkeypatch.setenv("COWORLD_GAME_VERSION", "fixture-source")
-    monkeypatch.setenv("COWORLD_SOURCE_REVISION", "d" * 40)
+    monkeypatch.setenv(
+        "COWORLD_SOURCE_REVISION",
+        "https://github.com/softmax-universe/coworld-gnomic/tree/main",
+    )
     monkeypatch.delenv("COGAME_LOAD_REPLAY_URI", raising=False)
     monkeypatch.delenv("COGAME_RESULTS_URI", raising=False)
     monkeypatch.delenv("COGAME_SAVE_REPLAY_URI", raising=False)
