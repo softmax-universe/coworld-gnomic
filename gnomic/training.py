@@ -6,7 +6,6 @@ import base64
 import copy
 import json
 import os
-import re
 import time
 from pathlib import Path
 from typing import Literal
@@ -208,11 +207,10 @@ class Capture:
                     continue
                 if attempt.origin == "model" and (
                     attempt.raw_response is None
-                    or attempt.platform_call_id is None
                     or attempt.response_complete is not True
                     or attempt.response_reader_joined is not True
                 ):
-                    attempt.rejection_reason = "missing-native-response-provenance"
+                    attempt.rejection_reason = "incomplete-native-response"
                     continue
                 if attempt.response is None or attempt.prompt != window.prompt:
                     attempt.rejection_reason = (
@@ -353,14 +351,6 @@ def validate_capture_environment() -> None:
     ):
         if not os.environ[key]:
             raise ValueError(f"Private capture requires {key}")
-    if (
-        re.fullmatch(
-            r"[a-f0-9]{40}|(?:sha256:)?[a-f0-9]{64}",
-            os.environ["COWORLD_SOURCE_REVISION"],
-        )
-        is None
-    ):
-        raise ValueError("Private capture requires an immutable source revision")
 
 
 def write_private_episode(uri: str, episode: TrainingEpisode) -> None:

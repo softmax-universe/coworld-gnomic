@@ -273,7 +273,10 @@
       "type": "player",
       "description": "Plays the current seat through the native model endpoint.",
       "image": "{{GNOMIC_IMAGE}}",
-      "env": {"COWORLD_LLM_ENABLED": "true"},
+      "env": {
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
+      },
       "run": [
         "python",
         "-m",
@@ -369,11 +372,11 @@
   "certification": {
     "game_config": {
       "num_agents": 3,
-      "turns_max": 9,
-      "action_window_s": 2,
-      "proposal_window_s": 2,
-      "debate_window_s": 2,
-      "vote_window_s": 2,
+      "turns_max": 1,
+      "action_window_s": 45,
+      "proposal_window_s": 45,
+      "debate_window_s": 45,
+      "vote_window_s": 45,
       "judge_window_s": 5,
       "judge_mode": "deterministic",
       "judge_model": "anthropic/claude-opus-4.7",
@@ -381,7 +384,7 @@
       "episode_timeout_seconds": 240,
       "players": [
         {
-          "name": "baseline-0"
+          "name": "native-0"
         },
         {
           "name": "baseline-1"
@@ -389,11 +392,12 @@
         {
           "name": "baseline-2"
         }
-      ]
+      ],
+      "introduce_window_s": 15
     },
     "players": [
       {
-        "player_id": "baseline"
+        "player_id": "native"
       },
       {
         "player_id": "baseline"

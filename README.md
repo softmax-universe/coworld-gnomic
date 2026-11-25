@@ -149,7 +149,8 @@ alone does not qualify CUDA serving, authenticated teacher data or hosted model
 performance. Do not run one local model process per seat.
 
 `COGAME_SAVE_TRAJECTORY_URI` activates a separate private artifact. Capture requires
-an episode ID, immutable source revision and published game version. The journal
+an episode ID, source reference and game version. Capture preserves the reference supplied
+by the runner. Training exports pin the immutable revision separately. The journal
 retains exact native requests, raw responses, actual response headers and call IDs,
 started calls, opponent generations, applied actions, outcomes and frozen Elder
 adjudications. It never adds private generation data to public replay or results.
