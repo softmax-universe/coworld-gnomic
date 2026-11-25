@@ -207,11 +207,10 @@ class Capture:
                     continue
                 if attempt.origin == "model" and (
                     attempt.raw_response is None
-                    or attempt.platform_call_id is None
                     or attempt.response_complete is not True
                     or attempt.response_reader_joined is not True
                 ):
-                    attempt.rejection_reason = "missing-native-response-provenance"
+                    attempt.rejection_reason = "incomplete-native-response"
                     continue
                 if attempt.response is None or attempt.prompt != window.prompt:
                     attempt.rejection_reason = (

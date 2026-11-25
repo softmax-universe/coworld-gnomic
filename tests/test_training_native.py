@@ -825,7 +825,37 @@ async def test_teacher_response_omits_rid_and_model_rejects_rid_or_extras(monkey
     )
     episode.capture.consumed(1, 2, {"rid": 2, "vote": "aye"}, {"vote": "aye"}, False)
 
+    # A missing platform receipt does not undo a vote the game really applied.
+    request = {
+        "type": "vote_request",
+        "rid": 3,
+        "turn": 1,
+        "timeout_s": 5,
+        "proposal": {},
+        "debates": [],
+    }
+    await episode._send(episode.channels[2], request)
+    window = episode.capture.windows[(2, 3)]
+    valid = bad_attempt.model_copy(
+        update={
+            "attempt_id": str(uuid4()),
+            "prompt": window.prompt,
+            "request": {"model": "fixture", "messages": window.prompt},
+            "platform_call_id": None,
+            "response": '{"vote":"aye"}',
+            "raw_response": json.dumps(
+                {"content": [{"type": "text", "text": '{"vote":"aye"}'}]}
+            ),
+        }
+    )
+    episode.capture.receive(
+        2,
+        {"type": "private_attempt", "rid": 3, "attempt": valid.model_dump(mode="json")},
+    )
+    episode.capture.consumed(2, 3, {"rid": 3, "vote": "aye"}, {"vote": "aye"}, False)
     record = episode.capture.finish()
+    assert record.decisions[2].action_status == "accepted"
+    assert record.decisions[2].attempts[0].platform_call_id is None
     teacher_attempt = record.decisions[0].attempts[0]
     assert teacher_attempt.origin == "teacher"
     assert json.loads(teacher_attempt.response) == {"action": "pass"}
