@@ -22,8 +22,7 @@ from gnomic.judge import ACTION_JUDGE_SYSTEM, JUDGE_SYSTEM
 from gnomic.llm_transport import Attempt, complete_native
 from gnomic.players.native import NativePolicy
 from gnomic.players.posttrain_prompt import REPLIES
-from gnomic.players.scribe import ScribePolicy
-from gnomic.players.sdk import GameView, run_ws_player
+from gnomic.players.sdk import run_ws_player
 from gnomic.server.app import GameServer, build_app
 from gnomic.training import TrainingEpisode
 
@@ -88,37 +87,32 @@ async def test_native_deadline_bounds_slow_response_body(monkeypatch):
         await asyncio.gather(*steps, return_exceptions=True)
 
 
-def fixture_reply(observation: dict) -> dict:
-    request = observation["request"]
-    view = GameView(
-        seat=observation["seat"],
-        turn=observation["turn"],
-        proposer=observation["proposer"],
-        rules=observation["rules"],
-        state=observation["state"],
-        proposal=observation["proposal"],
-        debates=observation["debates"],
-        history=observation["recent_turns"],
-        request=request,
-        session={"limits": observation["limits"]},
+def fixture_reply_for_prompt(prompt_text: str, seat: int) -> dict:
+    kind = next(
+        (phase for phase, shape in REPLIES.items() if prompt_text.endswith(shape)),
+        None,
     )
-    policy = ScribePolicy()
-    kind = request["type"]
+    assert kind is not None, f"Unrecognized prompt tail: {prompt_text[-120:]!r}"
+    assert f"Seat: {seat}" in prompt_text.splitlines()[0]
     if kind == "introduce_request":
-        result = {"name": f"Native-{view.seat}"}
-    elif kind == "action_request":
-        result = {"action": "I water the village garden."}
-    elif kind == "action_repair_request":
-        result = {"action": "pass"}
-    elif kind == "proposal_request":
-        result = {"proposal": policy.propose(view)}
-    elif kind == "debate_request":
-        result = policy.debate(view)
-    elif kind == "vote_request":
-        result = {"vote": policy.vote(view)}
-    else:
-        raise AssertionError(kind)
-    return result
+        return {"name": f"Native-{seat}"}
+    if kind == "action_request":
+        return {"action": "I water the village garden."}
+    if kind == "action_repair_request":
+        return {"action": "pass"}
+    if kind == "proposal_request":
+        return {
+            "proposal": {
+                "kind": "enact",
+                "text": "Each gnome may tend the commons once per turn.",
+                "rationale": "Steady garden rules.",
+            }
+        }
+    if kind == "debate_request":
+        return {"text": "I support this proposal.", "vote_intent": "aye"}
+    if kind == "vote_request":
+        return {"vote": "aye"}
+    raise AssertionError(kind)
 
 
 @pytest.mark.parametrize(
@@ -192,14 +186,14 @@ async def test_native_episode_retains_exact_calls_and_freezes_elder(
                     }
                 )
             else:
-                observation = json.loads(request["messages"][0]["content"])
-                assert int(slot) == observation["seat"]
+                prompt_text = request["messages"][0]["content"]
+                assert slot is not None
                 assert request["model"] == "checkpoint/" + "a" * 64
                 assert request["temperature"] == (0.7 if mode == "sampled" else 0)
                 text = (
                     "malformed"
                     if mode == "malformed"
-                    else json.dumps(fixture_reply(observation))
+                    else json.dumps(fixture_reply_for_prompt(prompt_text, int(slot)))
                 )
             reply = {
                 "model": request["model"],
@@ -386,12 +380,12 @@ async def test_native_episode_retains_exact_calls_and_freezes_elder(
         ]
         assert generated
         assert all(
-            a.request["system"].endswith(
-                REPLIES[
-                    json.loads(a.request["messages"][0]["content"])["request"]["type"]
-                ]
+            a.request["messages"][0]["content"].endswith(
+                REPLIES[d.observation["view"]["request"]["type"]]
             )
-            for a in generated
+            for d in episode.decisions
+            for a in d.attempts
+            if a.origin == "model"
         )
         environmental = [
             Attempt.model_validate(a)

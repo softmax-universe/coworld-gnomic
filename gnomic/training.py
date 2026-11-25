@@ -15,7 +15,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from .llm_transport import Attempt
-from .players.posttrain_prompt import messages_for
+from .players.posttrain_prompt import messages_for, observation_for
 from .players.sdk import GameView
 from .protocol import parse_reply_text
 
@@ -98,7 +98,7 @@ class Capture:
                 prompt = messages_for(self.views[seat])
                 self.windows[key] = RequestWindow(
                     request=copy.deepcopy(message),
-                    observation=json.loads(prompt[1]["content"]),
+                    observation=observation_for(self.views[seat]),
                     prompt=prompt,
                     deadline=time.monotonic() + message["timeout_s"],
                 )
